@@ -9,6 +9,9 @@ const sql = neon(process.env.DATABASE_URL);
 const allowedOrigins = [
   'http://localhost:3001', // Local development
   'http://localhost:3000', // Local development alternative
+  'https://capsaicin-frontend.vercel.app', // Your Vercel production URL
+  'https://capsaicin-frontend-git-main-uvaancovies-projects.vercel.app', // Vercel preview
+  'https://capsaicin-frontend-uvaancovies-projects.vercel.app', // Vercel alternative
   process.env.FRONTEND_URL, // Production frontend URL (will be set in Render)
 ].filter(Boolean); // Remove undefined values
 
@@ -19,20 +22,45 @@ app.use(cors({
     if (allowedOrigins.indexOf(origin) !== -1) {
       return callback(null, true);
     } else {
+      console.log('CORS blocked origin:', origin);
       return callback(new Error('Not allowed by CORS'));
     }
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
 
 const { registerUser, loginUser } = require('./auth');
 
-// Health check
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    message: 'Capsaicin Backend is running',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Root endpoint with database check
 app.get('/', async (req, res) => {
   try {
     const result = await sql`SELECT version()`;
-    res.json({ version: result[0].version });
+    res.json({ 
+      message: 'Capsaicin Backend API',
+      database: 'Connected',
+      version: result[0].version,
+      endpoints: {
+        health: '/health',
+        products: '/products',
+        auth: {
+          register: '/register',
+          login: '/login'
+        }
+      }
+    });
   } catch (err) {
     console.error('Database connection error:', err);
     res.status(500).json({ error: 'Database connection failed', details: err.message });
