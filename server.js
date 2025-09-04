@@ -103,6 +103,14 @@ app.get('/', async (req, res) => {
       endpoints: {
         health: '/health',
         products: '/products',
+        shipping: {
+          calculate: '/shipping/calculate'
+        },
+        payment: {
+          payfast_prepare: '/payment/payfast/prepare',
+          payfast_notify: '/payment/payfast/notify'
+        },
+        orders: '/orders',
         auth: {
           register: '/register',
           login: '/login'
@@ -294,10 +302,133 @@ app.post('/cart', async (req, res) => {
   res.json({ message: 'Cart endpoint placeholder' });
 });
 
-// Orders endpoint (example)
+// Shipping calculation endpoint
+app.post('/shipping/calculate', async (req, res) => {
+  try {
+    const { subtotal, shippingMethod } = req.body;
+    
+    if (!subtotal || isNaN(parseFloat(subtotal))) {
+      return res.status(400).json({ error: 'Valid subtotal is required' });
+    }
+    
+    const amount = parseFloat(subtotal);
+    
+    // South African shipping options
+    const shippingRates = {
+      'standard': { cost: 99.00, name: 'Standard Delivery', days: '5-7 business days' },
+      'express': { cost: 199.00, name: 'Express Delivery', days: '2-3 business days' },
+      'collection': { cost: 59.00, name: 'Store Collection', days: 'Same day' },
+      'free': { cost: 0.00, name: 'Free Delivery', days: '7-10 business days' }
+    };
+    
+    let shipping = shippingRates[shippingMethod] || shippingRates['standard'];
+    
+    // Free shipping over R500
+    if (amount >= 500) {
+      shipping = shippingRates['free'];
+    }
+    
+    res.json({
+      subtotal: amount,
+      shipping: shipping,
+      total: amount + shipping.cost,
+      freeShippingEligible: amount >= 500,
+      freeShippingThreshold: 500
+    });
+  } catch (err) {
+    console.error('Error calculating shipping:', err);
+    res.status(500).json({ error: 'Failed to calculate shipping' });
+  }
+});
+
+// PayFast payment preparation endpoint
+app.post('/payment/payfast/prepare', async (req, res) => {
+  try {
+    const { amount, item_name, email, firstName, lastName } = req.body;
+    
+    if (!amount || !item_name || !email) {
+      return res.status(400).json({ error: 'Amount, item name, and email are required' });
+    }
+    
+    // PayFast data (you'll need to set these in your .env)
+    const paymentData = {
+      merchant_id: process.env.PAYFAST_MERCHANT_ID || '10000100',
+      merchant_key: process.env.PAYFAST_MERCHANT_KEY || '46f0cd694581a',
+      return_url: `${process.env.FRONTEND_URL}/payment/success`,
+      cancel_url: `${process.env.FRONTEND_URL}/payment/cancel`,
+      notify_url: `${process.env.BACKEND_URL}/payment/payfast/notify`,
+      name_first: firstName || '',
+      name_last: lastName || '',
+      email_address: email,
+      m_payment_id: `ORDER_${Date.now()}`,
+      amount: parseFloat(amount).toFixed(2),
+      item_name: item_name,
+      custom_str1: 'Capsaicin E-commerce',
+      custom_str2: 'Online Order'
+    };
+    
+    res.json({
+      paymentData,
+      paymentUrl: process.env.PAYFAST_SANDBOX === 'true' 
+        ? 'https://sandbox.payfast.co.za/eng/process'
+        : 'https://www.payfast.co.za/eng/process'
+    });
+  } catch (err) {
+    console.error('Error preparing PayFast payment:', err);
+    res.status(500).json({ error: 'Failed to prepare payment' });
+  }
+});
+
+// PayFast notification endpoint (webhook)
+app.post('/payment/payfast/notify', async (req, res) => {
+  try {
+    console.log('PayFast notification received:', req.body);
+    
+    // TODO: Implement proper PayFast signature verification
+    // TODO: Update order status in database
+    // TODO: Send confirmation email
+    
+    res.status(200).send('OK');
+  } catch (err) {
+    console.error('Error processing PayFast notification:', err);
+    res.status(500).send('ERROR');
+  }
+});
+
+// Orders endpoint with PayFast integration
 app.post('/orders', async (req, res) => {
-  // TODO: Implement order logic
-  res.json({ message: 'Order endpoint placeholder' });
+  try {
+    const { items, shipping, payment, customer } = req.body;
+    
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Order items are required' });
+    }
+    
+    // Calculate order totals
+    const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    const shippingCost = shipping?.cost || 0;
+    const total = subtotal + shippingCost;
+    
+    // TODO: Create orders table and save order to database
+    // For now, return a success response
+    
+    const order = {
+      id: `ORDER_${Date.now()}`,
+      items,
+      subtotal: subtotal.toFixed(2),
+      shipping: shipping,
+      total: total.toFixed(2),
+      customer,
+      status: 'pending',
+      created_at: new Date().toISOString()
+    };
+    
+    console.log('Order created:', order);
+    res.status(201).json(order);
+  } catch (err) {
+    console.error('Error creating order:', err);
+    res.status(500).json({ error: 'Failed to create order' });
+  }
 });
 
 // Auth endpoints
