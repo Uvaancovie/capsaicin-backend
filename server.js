@@ -3,34 +3,53 @@ const express = require('express');
 const cors = require('cors');
 const { neon } = require('@neondatabase/serverless');
 const app = express();
-const sql = neon(process.env.DATABASE_URL);
 
-// Enable CORS for frontend - allow multiple origins for production
-const allowedOrigins = [
-  'http://localhost:3001', // Local development
-  'http://localhost:3000', // Local development alternative
-  'https://capsaicin-frontend.vercel.app', // Your Vercel production URL
-  'https://capsaicin-frontend-git-main-uvaancovies-projects.vercel.app', // Vercel preview
-  'https://capsaicin-frontend-uvaancovies-projects.vercel.app', // Vercel alternative
-  process.env.FRONTEND_URL, // Production frontend URL (will be set in Render)
-].filter(Boolean); // Remove undefined values
+// Optimized database connection with pooling
+const sql = neon(process.env.DATABASE_URL, {
+  poolSize: 10,
+  idleTimeout: 30000,
+  queryTimeout: 60000
+});
 
-app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, etc.)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      return callback(null, true);
-    } else {
-      console.log('CORS blocked origin:', origin);
-      return callback(new Error('Not allowed by CORS'));
-    }
-  },
+// Optimized CORS configuration for production
+const corsOptions = {
+  origin: [
+    'http://localhost:3001',
+    'http://localhost:3000',
+    'https://capsaicin-frontend.vercel.app',
+    'https://capsaicin-frontend-git-main-uvaancovies-projects.vercel.app',
+    'https://capsaicin-frontend-uvaancovies-projects.vercel.app',
+    process.env.FRONTEND_URL,
+  ].filter(Boolean),
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-app.use(express.json());
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  optionsSuccessStatus: 200,
+  preflightContinue: false
+};
+
+app.use(cors(corsOptions));
+
+// Add compression for better performance
+const compression = require('compression');
+app.use(compression());
+
+// Add request parsing with size limits
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Add response time header for monitoring
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    res.set('X-Response-Time', `${duration}ms`);
+    if (duration > 1000) {
+      console.log(`Slow request: ${req.method} ${req.path} - ${duration}ms`);
+    }
+  });
+  next();
+});
 
 const { registerUser, loginUser } = require('./auth');
 
@@ -104,75 +123,139 @@ app.post('/init-db', async (req, res) => {
   }
 });
 
-// Products endpoint (example)
+// In-memory cache for products (simple caching)
+let productsCache = null;
+let cacheTimestamp = 0;
+const CACHE_DURATION = 30000; // 30 seconds
+
+// Optimized products endpoint with caching
 app.get('/products', async (req, res) => {
   try {
-    const products = await sql`SELECT * FROM products ORDER BY created_at DESC`;
+    const now = Date.now();
+    
+    // Return cached data if still valid
+    if (productsCache && (now - cacheTimestamp) < CACHE_DURATION) {
+      res.set('X-Cache', 'HIT');
+      return res.json(productsCache);
+    }
+    
+    // Fetch from database with optimized query
+    const products = await sql`
+      SELECT id, name, description, price::text, stock_quantity, image_url, category, created_at 
+      FROM products 
+      ORDER BY created_at DESC 
+      LIMIT 100
+    `;
+    
+    // Update cache
+    productsCache = products;
+    cacheTimestamp = now;
+    
+    res.set('X-Cache', 'MISS');
     res.json(products);
   } catch (err) {
     console.error('Error fetching products:', err);
-    res.status(500).json({ error: 'Failed to fetch products', details: err.message });
+    res.status(500).json({ error: 'Failed to fetch products' });
   }
 });
 
-// Add new product (admin)
+// Optimized add new product endpoint
 app.post('/products', async (req, res) => {
   const { name, description, price, stock_quantity, category, image_url } = req.body;
-  if (!name || !price) {
-    return res.status(400).json({ error: 'Name and price are required' });
+  
+  // Enhanced validation
+  if (!name || name.trim().length === 0) {
+    return res.status(400).json({ error: 'Product name is required' });
+  }
+  if (!price || isNaN(parseFloat(price)) || parseFloat(price) <= 0) {
+    return res.status(400).json({ error: 'Valid price is required' });
   }
   
   try {
     const result = await sql`
       INSERT INTO products (name, description, price, stock_quantity, category, image_url)
-      VALUES (${name}, ${description || ''}, ${price}, ${stock_quantity || 0}, ${category || ''}, ${image_url || ''})
-      RETURNING *
+      VALUES (
+        ${name.trim()}, 
+        ${description?.trim() || ''}, 
+        ${parseFloat(price)}, 
+        ${parseInt(stock_quantity) || 0}, 
+        ${category?.trim() || ''}, 
+        ${image_url?.trim() || ''}
+      )
+      RETURNING id, name, description, price::text, stock_quantity, category, image_url, created_at
     `;
+    
+    // Clear cache when new product is added
+    productsCache = null;
+    
     console.log('Product added:', result[0]);
-    res.json(result[0]);
+    res.status(201).json(result[0]);
   } catch (err) {
     console.error('Error adding product:', err);
-    res.status(500).json({ error: 'Failed to add product', details: err.message });
+    res.status(500).json({ error: 'Failed to add product' });
   }
 });
 
-// Update product (admin)
+// Optimized update product endpoint
 app.put('/products/:id', async (req, res) => {
-  const { id } = req.params;
+  const productId = parseInt(req.params.id);
   const { name, description, price, stock_quantity, category, image_url } = req.body;
+  
+  if (isNaN(productId)) {
+    return res.status(400).json({ error: 'Invalid product ID' });
+  }
   
   try {
     const result = await sql`
       UPDATE products 
-      SET name = ${name}, description = ${description}, price = ${price}, 
-          stock_quantity = ${stock_quantity}, category = ${category}, 
-          image_url = ${image_url}, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${id}
-      RETURNING *
+      SET 
+        name = ${name?.trim() || name}, 
+        description = ${description?.trim() || description}, 
+        price = ${parseFloat(price) || price}, 
+        stock_quantity = ${parseInt(stock_quantity) || stock_quantity}, 
+        category = ${category?.trim() || category}, 
+        image_url = ${image_url?.trim() || image_url}, 
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ${productId}
+      RETURNING id, name, description, price::text, stock_quantity, category, image_url, updated_at
     `;
+    
     if (result.length === 0) {
       return res.status(404).json({ error: 'Product not found' });
     }
+    
+    // Clear cache when product is updated
+    productsCache = null;
+    
     res.json(result[0]);
   } catch (err) {
     console.error('Error updating product:', err);
-    res.status(500).json({ error: 'Failed to update product', details: err.message });
+    res.status(500).json({ error: 'Failed to update product' });
   }
 });
 
-// Delete product (admin)
+// Optimized delete product endpoint
 app.delete('/products/:id', async (req, res) => {
-  const { id } = req.params;
+  const productId = parseInt(req.params.id);
+  
+  if (isNaN(productId)) {
+    return res.status(400).json({ error: 'Invalid product ID' });
+  }
   
   try {
-    const result = await sql`DELETE FROM products WHERE id = ${id} RETURNING *`;
+    const result = await sql`DELETE FROM products WHERE id = ${productId} RETURNING id`;
+    
     if (result.length === 0) {
       return res.status(404).json({ error: 'Product not found' });
     }
-    res.json({ message: 'Product deleted successfully' });
+    
+    // Clear cache when product is deleted
+    productsCache = null;
+    
+    res.json({ message: 'Product deleted successfully', id: productId });
   } catch (err) {
     console.error('Error deleting product:', err);
-    res.status(500).json({ error: 'Failed to delete product', details: err.message });
+    res.status(500).json({ error: 'Failed to delete product' });
   }
 });
 
