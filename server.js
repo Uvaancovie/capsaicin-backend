@@ -38,16 +38,17 @@ app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Add response time header for monitoring
+// Simple request timing middleware (no headers, just logging)
 app.use((req, res, next) => {
   const start = Date.now();
+  
   res.on('finish', () => {
     const duration = Date.now() - start;
-    res.set('X-Response-Time', `${duration}ms`);
     if (duration > 1000) {
       console.log(`Slow request: ${req.method} ${req.path} - ${duration}ms`);
     }
   });
+  
   next();
 });
 
