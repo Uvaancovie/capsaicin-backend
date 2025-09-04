@@ -11,22 +11,50 @@ const sql = neon(process.env.DATABASE_URL, {
   queryTimeout: 60000
 });
 
-// Optimized CORS configuration for production
+// More permissive CORS configuration for debugging
 const corsOptions = {
-  origin: [
-    'http://localhost:3001',
-    'http://localhost:3000',
-    'https://capsaicin-frontend.vercel.app',
-    'https://capsaicin-frontend-git-main-uvaancovies-projects.vercel.app',
-    'https://capsaicin-frontend-uvaancovies-projects.vercel.app',
-    process.env.FRONTEND_URL,
-  ].filter(Boolean),
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      'http://localhost:3001',
+      'http://localhost:3000',
+      'https://capsaicin-frontend.vercel.app',
+      'https://capsaicin-frontend-git-main-uvaancovies-projects.vercel.app',
+      'https://capsaicin-frontend-uvaancovies-projects.vercel.app',
+      process.env.FRONTEND_URL,
+    ].filter(Boolean);
+
+    console.log(`CORS check - Origin: ${origin}`);
+    console.log(`Allowed origins:`, allowedOrigins);
+
+    // Allow requests with no origin (mobile apps, server-to-server, etc.)
+    if (!origin) {
+      console.log('No origin - allowing request');
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      console.log(`Origin ${origin} is allowed`);
+      return callback(null, true);
+    } else {
+      console.log(`Origin ${origin} is NOT allowed`);
+      const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
+      return callback(new Error(msg), false);
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With'],
+  exposedHeaders: ['X-Cache', 'X-Response-Time'],
   optionsSuccessStatus: 200,
   preflightContinue: false
 };
+
+// Debug CORS for troubleshooting
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  console.log(`Request from origin: ${origin}`);
+  next();
+});
 
 app.use(cors(corsOptions));
 
