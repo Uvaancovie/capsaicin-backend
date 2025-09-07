@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: capsaicin-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        value: mongodb+srv://way2flyagency:way2flymillionaire@mern.7txgf4m.mongodb.net/capsaicin-ecommerce
+      - key: PORT
+        value: 4000

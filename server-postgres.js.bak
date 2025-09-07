@@ -1,0 +1,669 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { neon } = require('@neondatabase/serverless');
+const app = express();
+
+// Optimized database connection with pooling
+const sql = neon(process.env.DATABASE_URL, {
+  poolSize: 10,
+  idleTimeout: 30000,
+  queryTimeout: 60000
+});
+
+// More permissive CORS configuration for debugging
+const corsOptions = {
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      'http://localhost:3001',
+      'http://localhost:3000',
+      'https://capsaicin-frontend.vercel.app',
+      'https://capsaicin-frontend-git-main-uvaancovies-projects.vercel.app',
+      'https://capsaicin-frontend-uvaancovies-projects.vercel.app',
+      process.env.FRONTEND_URL,
+    ].filter(Boolean);
+
+    console.log(`CORS check - Origin: ${origin}`);
+    console.log(`Allowed origins:`, allowedOrigins);
+
+    // Allow requests with no origin (mobile apps, server-to-server, etc.)
+    if (!origin) {
+      console.log('No origin - allowing request');
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      console.log(`Origin ${origin} is allowed`);
+      return callback(null, true);
+    } else {
+      console.log(`Origin ${origin} is NOT allowed`);
+      const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
+      return callback(new Error(msg), false);
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With'],
+  exposedHeaders: ['X-Cache', 'X-Response-Time'],
+  optionsSuccessStatus: 200,
+  preflightContinue: false
+};
+
+// Debug CORS for troubleshooting
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  console.log(`Request from origin: ${origin}`);
+  next();
+});
+
+app.use(cors(corsOptions));
+
+// Add compression for better performance
+const compression = require('compression');
+app.use(compression());
+
+// Add request parsing with size limits
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Simple request timing middleware (no headers, just logging)
+app.use((req, res, next) => {
+  const start = Date.now();
+  
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (duration > 1000) {
+      console.log(`Slow request: ${req.method} ${req.path} - ${duration}ms`);
+    }
+  });
+  
+  next();
+});
+
+const { registerUser, loginUser } = require('./auth');
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    message: 'Capsaicin Backend is running',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Root endpoint with database check
+app.get('/', async (req, res) => {
+  try {
+    const result = await sql`SELECT version()`;
+    res.json({ 
+      message: 'Capsaicin Backend API',
+      database: 'Connected',
+      version: result[0].version,
+      endpoints: {
+        health: '/health',
+        products: '/products',
+        shipping: {
+          calculate: '/shipping/calculate'
+        },
+        payment: {
+          payfast_prepare: '/payment/payfast/prepare',
+          payfast_notify: '/payment/payfast/notify'
+        },
+        invoices: {
+          create: '/invoices',
+          list: '/invoices',
+          get: '/invoices/:id',
+          updateStatus: '/invoices/:id/status'
+        },
+        admin: {
+          login: '/admin/login'
+        },
+        orders: '/orders',
+        auth: {
+          register: '/register',
+          login: '/login'
+        }
+      }
+    });
+  } catch (err) {
+    console.error('Database connection error:', err);
+    res.status(500).json({ error: 'Database connection failed', details: err.message });
+  }
+});
+
+// Initialize database tables
+app.post('/init-db', async (req, res) => {
+  try {
+    // Create users table
+    await sql`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `;
+    
+    // Create products table
+    await sql`
+      CREATE TABLE IF NOT EXISTS products (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        price DECIMAL(10, 2) NOT NULL,
+        stock_quantity INTEGER DEFAULT 0,
+        image_url VARCHAR(255),
+        category VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `;
+
+    // Create invoices table
+    await sql`
+      CREATE TABLE IF NOT EXISTS invoices (
+        id SERIAL PRIMARY KEY,
+        invoice_number VARCHAR(50) UNIQUE NOT NULL,
+        customer_name VARCHAR(255) NOT NULL,
+        customer_email VARCHAR(255) NOT NULL,
+        customer_phone VARCHAR(50),
+        customer_address TEXT,
+        items JSONB NOT NULL,
+        subtotal DECIMAL(10, 2) NOT NULL,
+        shipping_cost DECIMAL(10, 2) NOT NULL,
+        total DECIMAL(10, 2) NOT NULL,
+        status VARCHAR(50) DEFAULT 'pending',
+        shipping_method VARCHAR(100),
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `;
+
+    console.log('Database tables created successfully');
+    res.json({ message: 'Database initialized successfully' });
+  } catch (err) {
+    console.error('Database initialization error:', err);
+    res.status(500).json({ error: 'Database initialization failed', details: err.message });
+  }
+});
+
+// In-memory cache for products (simple caching)
+let productsCache = null;
+let cacheTimestamp = 0;
+const CACHE_DURATION = 30000; // 30 seconds
+
+// Optimized products endpoint with caching
+app.get('/products', async (req, res) => {
+  try {
+    const now = Date.now();
+    
+    // Return cached data if still valid
+    if (productsCache && (now - cacheTimestamp) < CACHE_DURATION) {
+      res.set('X-Cache', 'HIT');
+      return res.json(productsCache);
+    }
+    
+    // Fetch from database with optimized query
+    const products = await sql`
+      SELECT id, name, description, price::text, stock_quantity, image_url, category, created_at 
+      FROM products 
+      ORDER BY created_at DESC 
+      LIMIT 100
+    `;
+    
+    // Update cache
+    productsCache = products;
+    cacheTimestamp = now;
+    
+    res.set('X-Cache', 'MISS');
+    res.json(products);
+  } catch (err) {
+    console.error('Error fetching products:', err);
+    res.status(500).json({ error: 'Failed to fetch products' });
+  }
+});
+
+// Optimized add new product endpoint
+app.post('/products', async (req, res) => {
+  const { name, description, price, stock_quantity, category, image_url } = req.body;
+  
+  // Enhanced validation
+  if (!name || name.trim().length === 0) {
+    return res.status(400).json({ error: 'Product name is required' });
+  }
+  if (!price || isNaN(parseFloat(price)) || parseFloat(price) <= 0) {
+    return res.status(400).json({ error: 'Valid price is required' });
+  }
+  
+  try {
+    const result = await sql`
+      INSERT INTO products (name, description, price, stock_quantity, category, image_url)
+      VALUES (
+        ${name.trim()}, 
+        ${description?.trim() || ''}, 
+        ${parseFloat(price)}, 
+        ${parseInt(stock_quantity) || 0}, 
+        ${category?.trim() || ''}, 
+        ${image_url?.trim() || ''}
+      )
+      RETURNING id, name, description, price::text, stock_quantity, category, image_url, created_at
+    `;
+    
+    // Clear cache when new product is added
+    productsCache = null;
+    
+    console.log('Product added:', result[0]);
+    res.status(201).json(result[0]);
+  } catch (err) {
+    console.error('Error adding product:', err);
+    res.status(500).json({ error: 'Failed to add product' });
+  }
+});
+
+// Optimized update product endpoint
+app.put('/products/:id', async (req, res) => {
+  const productId = parseInt(req.params.id);
+  const { name, description, price, stock_quantity, category, image_url } = req.body;
+  
+  if (isNaN(productId)) {
+    return res.status(400).json({ error: 'Invalid product ID' });
+  }
+  
+  try {
+    const result = await sql`
+      UPDATE products 
+      SET 
+        name = ${name?.trim() || name}, 
+        description = ${description?.trim() || description}, 
+        price = ${parseFloat(price) || price}, 
+        stock_quantity = ${parseInt(stock_quantity) || stock_quantity}, 
+        category = ${category?.trim() || category}, 
+        image_url = ${image_url?.trim() || image_url}, 
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ${productId}
+      RETURNING id, name, description, price::text, stock_quantity, category, image_url, updated_at
+    `;
+    
+    if (result.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    // Clear cache when product is updated
+    productsCache = null;
+    
+    res.json(result[0]);
+  } catch (err) {
+    console.error('Error updating product:', err);
+    res.status(500).json({ error: 'Failed to update product' });
+  }
+});
+
+// Optimized delete product endpoint
+app.delete('/products/:id', async (req, res) => {
+  const productId = parseInt(req.params.id);
+  
+  if (isNaN(productId)) {
+    return res.status(400).json({ error: 'Invalid product ID' });
+  }
+  
+  try {
+    const result = await sql`DELETE FROM products WHERE id = ${productId} RETURNING id`;
+    
+    if (result.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    // Clear cache when product is deleted
+    productsCache = null;
+    
+    res.json({ message: 'Product deleted successfully', id: productId });
+  } catch (err) {
+    console.error('Error deleting product:', err);
+    res.status(500).json({ error: 'Failed to delete product' });
+  }
+});
+
+// Cart endpoint (example)
+app.post('/cart', async (req, res) => {
+  // TODO: Implement cart logic
+  res.json({ message: 'Cart endpoint placeholder' });
+});
+
+// Shipping calculation endpoint
+app.post('/shipping/calculate', async (req, res) => {
+  try {
+    const { subtotal, shippingMethod } = req.body;
+    
+    if (!subtotal || isNaN(parseFloat(subtotal))) {
+      return res.status(400).json({ error: 'Valid subtotal is required' });
+    }
+    
+    const amount = parseFloat(subtotal);
+    
+    // South African shipping options
+    const shippingRates = {
+      'standard': { cost: 99.00, name: 'Standard Delivery', days: '5-7 business days' },
+      'express': { cost: 199.00, name: 'Express Delivery', days: '2-3 business days' },
+      'collection': { cost: 59.00, name: 'Store Collection', days: 'Same day' },
+      'free': { cost: 0.00, name: 'Free Delivery', days: '7-10 business days' }
+    };
+    
+    let shipping = shippingRates[shippingMethod] || shippingRates['standard'];
+    
+    // Free shipping over R500
+    if (amount >= 500) {
+      shipping = shippingRates['free'];
+    }
+    
+    res.json({
+      subtotal: amount,
+      shipping: shipping,
+      total: amount + shipping.cost,
+      freeShippingEligible: amount >= 500,
+      freeShippingThreshold: 500
+    });
+  } catch (err) {
+    console.error('Error calculating shipping:', err);
+    res.status(500).json({ error: 'Failed to calculate shipping' });
+  }
+});
+
+// PayFast payment preparation endpoint
+app.post('/payment/payfast/prepare', async (req, res) => {
+  try {
+    const { amount, item_name, email, firstName, lastName } = req.body;
+    
+    if (!amount || !item_name || !email) {
+      return res.status(400).json({ error: 'Amount, item name, and email are required' });
+    }
+    
+    // PayFast data (you'll need to set these in your .env)
+    const paymentData = {
+      merchant_id: process.env.PAYFAST_MERCHANT_ID || '10000100',
+      merchant_key: process.env.PAYFAST_MERCHANT_KEY || '46f0cd694581a',
+      return_url: `${process.env.FRONTEND_URL}/payment/success`,
+      cancel_url: `${process.env.FRONTEND_URL}/payment/cancel`,
+      notify_url: `${process.env.BACKEND_URL}/payment/payfast/notify`,
+      name_first: firstName || '',
+      name_last: lastName || '',
+      email_address: email,
+      m_payment_id: `ORDER_${Date.now()}`,
+      amount: parseFloat(amount).toFixed(2),
+      item_name: item_name,
+      custom_str1: 'Capsaicin E-commerce',
+      custom_str2: 'Online Order'
+    };
+    
+    res.json({
+      paymentData,
+      paymentUrl: process.env.PAYFAST_SANDBOX === 'true' 
+        ? 'https://sandbox.payfast.co.za/eng/process'
+        : 'https://www.payfast.co.za/eng/process'
+    });
+  } catch (err) {
+    console.error('Error preparing PayFast payment:', err);
+    res.status(500).json({ error: 'Failed to prepare payment' });
+  }
+});
+
+// PayFast notification endpoint (webhook)
+app.post('/payment/payfast/notify', async (req, res) => {
+  try {
+    console.log('PayFast ITN received:', req.body);
+    
+    const {
+      m_payment_id,
+      pf_payment_id,
+      payment_status,
+      amount_gross,
+      amount_fee,
+      amount_net,
+      name_first,
+      name_last,
+      email_address,
+      signature
+    } = req.body;
+    
+    // TODO: Implement proper PayFast signature verification
+    // For now, log the important details
+    console.log('Payment Details:', {
+      orderId: m_payment_id,
+      paymentId: pf_payment_id,
+      status: payment_status,
+      amount: amount_gross,
+      customer: `${name_first} ${name_last}`,
+      email: email_address
+    });
+    
+    // TODO: Update order status in database based on payment_status
+    // payment_status can be: COMPLETE, FAILED, PENDING
+    
+    if (payment_status === 'COMPLETE') {
+      console.log(`✅ Payment successful for order ${m_payment_id}`);
+      // TODO: Mark order as paid, send confirmation email, update inventory
+    } else if (payment_status === 'FAILED') {
+      console.log(`❌ Payment failed for order ${m_payment_id}`);
+      // TODO: Mark order as failed, notify customer
+    } else if (payment_status === 'PENDING') {
+      console.log(`⏳ Payment pending for order ${m_payment_id}`);
+      // TODO: Mark order as pending, wait for completion
+    }
+    
+    // Always respond with OK to acknowledge receipt
+    res.status(200).send('OK');
+  } catch (err) {
+    console.error('Error processing PayFast notification:', err);
+    res.status(500).send('ERROR');
+  }
+});
+
+// Orders endpoint with PayFast integration
+app.post('/orders', async (req, res) => {
+  try {
+    const { items, shipping, payment, customer } = req.body;
+    
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Order items are required' });
+    }
+    
+    // Calculate order totals
+    const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    const shippingCost = shipping?.cost || 0;
+    const total = subtotal + shippingCost;
+    
+    // TODO: Create orders table and save order to database
+    // For now, return a success response
+    
+    const order = {
+      id: `ORDER_${Date.now()}`,
+      items,
+      subtotal: subtotal.toFixed(2),
+      shipping: shipping,
+      total: total.toFixed(2),
+      customer,
+      status: 'pending',
+      created_at: new Date().toISOString()
+    };
+    
+    console.log('Order created:', order);
+    res.status(201).json(order);
+  } catch (err) {
+    console.error('Error creating order:', err);
+    res.status(500).json({ error: 'Failed to create order' });
+  }
+});
+
+// Invoice endpoints
+app.post('/invoices', async (req, res) => {
+  try {
+    const { 
+      customer_name, 
+      customer_email, 
+      customer_phone, 
+      customer_address,
+      items, 
+      subtotal, 
+      shipping_cost, 
+      total,
+      shipping_method,
+      notes 
+    } = req.body;
+    
+    // Validation
+    if (!customer_name || !customer_email || !items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Customer name, email, and items are required' });
+    }
+    
+    // Generate invoice number
+    const invoiceNumber = `INV-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+    
+    const result = await sql`
+      INSERT INTO invoices (
+        invoice_number, customer_name, customer_email, customer_phone, 
+        customer_address, items, subtotal, shipping_cost, total, 
+        shipping_method, notes
+      )
+      VALUES (
+        ${invoiceNumber}, ${customer_name}, ${customer_email}, ${customer_phone || ''}, 
+        ${customer_address || ''}, ${JSON.stringify(items)}, ${parseFloat(subtotal)}, 
+        ${parseFloat(shipping_cost)}, ${parseFloat(total)}, 
+        ${shipping_method || 'standard'}, ${notes || ''}
+      )
+      RETURNING *
+    `;
+    
+    console.log('Invoice created:', result[0]);
+    res.status(201).json(result[0]);
+  } catch (err) {
+    console.error('Error creating invoice:', err);
+    res.status(500).json({ error: 'Failed to create invoice' });
+  }
+});
+
+// Get all invoices (admin only)
+app.get('/invoices', async (req, res) => {
+  try {
+    const { status } = req.query;
+    let query = sql`SELECT * FROM invoices ORDER BY created_at DESC`;
+    
+    if (status) {
+      query = sql`SELECT * FROM invoices WHERE status = ${status} ORDER BY created_at DESC`;
+    }
+    
+    const invoices = await query;
+    res.json(invoices);
+  } catch (err) {
+    console.error('Error fetching invoices:', err);
+    res.status(500).json({ error: 'Failed to fetch invoices' });
+  }
+});
+
+// Get single invoice
+app.get('/invoices/:id', async (req, res) => {
+  try {
+    const invoiceId = parseInt(req.params.id);
+    
+    if (isNaN(invoiceId)) {
+      return res.status(400).json({ error: 'Invalid invoice ID' });
+    }
+    
+    const result = await sql`SELECT * FROM invoices WHERE id = ${invoiceId}`;
+    
+    if (result.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    res.json(result[0]);
+  } catch (err) {
+    console.error('Error fetching invoice:', err);
+    res.status(500).json({ error: 'Failed to fetch invoice' });
+  }
+});
+
+// Update invoice status
+app.put('/invoices/:id/status', async (req, res) => {
+  try {
+    const invoiceId = parseInt(req.params.id);
+    const { status } = req.body;
+    
+    if (isNaN(invoiceId)) {
+      return res.status(400).json({ error: 'Invalid invoice ID' });
+    }
+    
+    if (!status) {
+      return res.status(400).json({ error: 'Status is required' });
+    }
+    
+    const result = await sql`
+      UPDATE invoices 
+      SET status = ${status}, updated_at = CURRENT_TIMESTAMP 
+      WHERE id = ${invoiceId}
+      RETURNING *
+    `;
+    
+    if (result.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    res.json(result[0]);
+  } catch (err) {
+    console.error('Error updating invoice status:', err);
+    res.status(500).json({ error: 'Failed to update invoice status' });
+  }
+});
+
+// Admin authentication
+app.post('/admin/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    if (username === 'admincapepharm' && password === 'capepharm123$') {
+      // In production, use proper JWT tokens
+      res.json({ 
+        success: true, 
+        token: 'admin-token-' + Date.now(),
+        user: { username: 'admincapepharm', role: 'admin' }
+      });
+    } else {
+      res.status(401).json({ error: 'Invalid credentials' });
+    }
+  } catch (err) {
+    console.error('Admin login error:', err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Auth endpoints
+app.post('/register', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  try {
+    console.log('Attempting to register user:', email);
+    const user = await registerUser(email, password);
+    console.log('User registered successfully:', user);
+    res.json({ user });
+  } catch (err) {
+    console.error('Registration error:', err);
+    res.status(500).json({ error: 'Registration failed', details: err.message });
+  }
+});
+
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  try {
+    const result = await loginUser(email, password);
+    if (!result) return res.status(401).json({ error: 'Invalid credentials' });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: 'Login failed', details: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Express server running at http://localhost:${PORT}`);
+});

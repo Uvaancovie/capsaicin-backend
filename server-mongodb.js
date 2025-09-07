@@ -4,23 +4,20 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors({
-  origin: [
-    'http://localhost:3001', 
-    'http://localhost:4000', 
-    'https://capsaicin-frontend.vercel.app',
-    'https://capsaicin-ecommerce.vercel.app',
-    'https://your-vercel-app.vercel.app' // Replace with your actual Vercel domain
-  ],
+  origin: ['http://localhost:3001', 'http://localhost:3000', 'https://capsaicin-frontend.vercel.app'],
   credentials: true
 }));
 app.use(express.json());
 
 // MongoDB connection
-mongoose.connect(process.env.MONGODB_URI)
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
 .then(() => console.log('Connected to MongoDB'))
 .catch(err => console.error('MongoDB connection error:', err));
 
@@ -147,15 +144,6 @@ app.get('/', (req, res) => {
   res.json({ message: 'Capsaicin Backend API is running!' });
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    message: 'Server is healthy',
-    timestamp: new Date().toISOString()
-  });
-});
-
 // Invoice Routes
 app.post('/invoices', async (req, res) => {
   try {
@@ -191,16 +179,10 @@ app.post('/invoices', async (req, res) => {
     const savedInvoice = await invoice.save();
     console.log('Invoice created successfully:', savedInvoice.invoice_number);
     
-    // Transform saved invoice to include id field for frontend compatibility
-    const transformedInvoice = {
-      ...savedInvoice.toObject(),
-      id: savedInvoice._id.toString()
-    };
-    
     res.status(201).json({
       success: true,
       message: 'Invoice created successfully',
-      invoice: transformedInvoice
+      invoice: savedInvoice
     });
   } catch (error) {
     console.error('Error creating invoice:', error);
@@ -217,12 +199,7 @@ app.get('/invoices', async (req, res) => {
     console.log('Fetching all invoices');
     const invoices = await Invoice.find().sort({ createdAt: -1 });
     console.log(`Found ${invoices.length} invoices`);
-    // Transform invoices to include id field for frontend compatibility
-    const transformedInvoices = invoices.map(invoice => ({
-      ...invoice.toObject(),
-      id: invoice._id.toString()
-    }));
-    res.json(transformedInvoices);
+    res.json(invoices);
   } catch (error) {
     console.error('Error fetching invoices:', error);
     res.status(500).json({
@@ -242,12 +219,7 @@ app.get('/invoices/:id', async (req, res) => {
         message: 'Invoice not found'
       });
     }
-    // Transform invoice to include id field for frontend compatibility
-    const transformedInvoice = {
-      ...invoice.toObject(),
-      id: invoice._id.toString()
-    };
-    res.json(transformedInvoice);
+    res.json(invoice);
   } catch (error) {
     console.error('Error fetching invoice:', error);
     res.status(500).json({
@@ -334,12 +306,7 @@ app.post('/admin/login', async (req, res) => {
 app.get('/products', async (req, res) => {
   try {
     const products = await Product.find();
-    // Transform products to include id field for frontend compatibility
-    const transformedProducts = products.map(product => ({
-      ...product.toObject(),
-      id: product._id.toString()
-    }));
-    res.json(transformedProducts);
+    res.json(products);
   } catch (error) {
     console.error('Error fetching products:', error);
     res.status(500).json({
@@ -352,21 +319,12 @@ app.get('/products', async (req, res) => {
 
 app.post('/products', async (req, res) => {
   try {
-    console.log('Creating new product:', req.body);
     const product = new Product(req.body);
     const savedProduct = await product.save();
-    
-    // Transform product to include id field for frontend compatibility
-    const transformedProduct = {
-      ...savedProduct.toObject(),
-      id: savedProduct._id.toString()
-    };
-    
-    console.log('Product created successfully');
     res.status(201).json({
       success: true,
       message: 'Product created successfully',
-      product: transformedProduct
+      product: savedProduct
     });
   } catch (error) {
     console.error('Error creating product:', error);
@@ -380,9 +338,6 @@ app.post('/products', async (req, res) => {
 
 app.put('/products/:id', async (req, res) => {
   try {
-    console.log(`Updating product with ID: ${req.params.id}`);
-    console.log('Update data:', req.body);
-    
     const product = await Product.findByIdAndUpdate(
       req.params.id,
       req.body,
@@ -390,24 +345,16 @@ app.put('/products/:id', async (req, res) => {
     );
     
     if (!product) {
-      console.log('Product not found');
       return res.status(404).json({
         success: false,
         message: 'Product not found'
       });
     }
 
-    console.log('Product updated successfully');
-    // Transform product to include id field for frontend compatibility
-    const transformedProduct = {
-      ...product.toObject(),
-      id: product._id.toString()
-    };
-
     res.json({
       success: true,
       message: 'Product updated successfully',
-      product: transformedProduct
+      product
     });
   } catch (error) {
     console.error('Error updating product:', error);
