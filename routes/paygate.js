@@ -132,6 +132,28 @@ router.get('/paygate/selfcheck', async (req, res) => {
   }
 });
 
+// Self-test route to verify checksum builder with official PayGate test vector
+router.get('/paygate/selftest', (req, res) => {
+  const crypto = require('crypto');
+  const md5 = s => crypto.createHash('md5').update(s).digest('hex');
+  const fields = {
+    PAYGATE_ID: "10011072130",
+    REFERENCE: "pgtest_123456789",
+    AMOUNT: "3299",
+    CURRENCY: "ZAR",
+    RETURN_URL: "https://my.return.url/page",
+    TRANSACTION_DATE: "2018-01-01 12:00:00",
+    LOCALE: "en-za",
+    COUNTRY: "ZAF",
+    EMAIL: "customer@paygate.co.za",
+  };
+  const src = Object.values(fields).join("") + "secret";
+  const computedMd5 = md5(src);
+  const expected = "59229d9c6cb336ae4bd287c87e6f0220";
+  const match = computedMd5 === expected;
+  res.json({ src, computedMd5, expected, match });
+});
+
 // Health endpoint
 router.get('/paygate/health', (req, res) => {
   res.json({ success: true, message: 'PayGate route healthy' });
