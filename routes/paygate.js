@@ -23,7 +23,7 @@ router.post('/paygate/initiate', express.json(), async (req, res) => {
     const RETURN_URL = process.env.PAYGATE_RETURN_URL || '';
     const NOTIFY_URL = process.env.PAYGATE_NOTIFY_URL || '';
 
-    const payload = {
+    const basePayload = {
       PAYGATE_ID,
       REFERENCE: String(orderId),
       AMOUNT: String(Math.round(Number(amountRands) * 100)), // cents
@@ -32,47 +32,102 @@ router.post('/paygate/initiate', express.json(), async (req, res) => {
       TRANSACTION_DATE: new Date().toISOString().slice(0, 19).replace('T', ' '),
       LOCALE: 'en-za',
       COUNTRY: 'ZAF',
-      EMAIL: email || '',
-      NOTIFY_URL: NOTIFY_URL || ''
+      EMAIL: email || ''
     };
 
-    // Build checksum in documented order. Include NOTIFY_URL if present.
-    const checksumValues = [
-      payload.PAYGATE_ID,
-      payload.REFERENCE,
-      String(payload.AMOUNT),
-      payload.CURRENCY,
-      payload.RETURN_URL,
-      payload.TRANSACTION_DATE,
-      payload.LOCALE,
-      payload.COUNTRY,
-      payload.EMAIL,
-      payload.NOTIFY_URL || ''
+    const fetch = global.fetch || require('node-fetch');
+
+    // Try a sequence of checksum variants to handle subtle MAP differences.
+    const variants = [
+      { name: 'with_notify', includeNotify: true, locale: 'en-za', country: 'ZAF' },
+      { name: 'no_notify', includeNotify: false, locale: 'en-za', country: 'ZAF' },
+      { name: 'locale_en_country_ZA', includeNotify: false, locale: 'en', country: 'ZA' },
+      // Try excluding RETURN_URL from checksum (some MAPs differ)
+      { name: 'no_return_in_checksum', includeNotify: true, locale: 'en-za', country: 'ZAF', excludeReturn: true },
+      // Alternate transaction date formats
+      { name: 'txndate_iso_t', includeNotify: true, locale: 'en-za', country: 'ZAF', txnDateIsoT: true },
+      { name: 'txndate_secondsless', includeNotify: true, locale: 'en-za', country: 'ZAF', txnDateSecondsless: true }
     ];
 
-    payload.CHECKSUM = payweb3Checksum(checksumValues);
+    const attempts = [];
+    let finalReply = null;
 
-    // Post to PayWeb3 initiate.trans
-    const body = new URLSearchParams(payload).toString();
-    const fetch = global.fetch || require('node-fetch');
-    const r = await fetch('https://secure.paygate.co.za/payweb3/initiate.trans', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body
-    });
+    for (const v of variants) {
+      const payload = Object.assign({}, basePayload);
+      payload.LOCALE = v.locale;
+      payload.COUNTRY = v.country;
+      if (v.includeNotify) payload.NOTIFY_URL = NOTIFY_URL || '';
 
-    const text = await r.text();
-    // PayGate returns key=value&...; parse
-    const reply = Object.fromEntries(new URLSearchParams(text));
+      // prepare TRANSACTION_DATE formatting variants
+      if (v.txnDateIsoT) {
+        payload.TRANSACTION_DATE = new Date().toISOString().slice(0, 19);
+      } else if (v.txnDateSecondsless) {
+        payload.TRANSACTION_DATE = new Date().toISOString().slice(0, 16).replace('T', ' ');
+      } else {
+        payload.TRANSACTION_DATE = new Date().toISOString().slice(0, 19).replace('T', ' ');
+      }
 
-    // Verify reply checksum
-    const expect = payweb3Checksum([reply.PAYGATE_ID || '', reply.PAY_REQUEST_ID || '', reply.REFERENCE || '']);
-    if (!reply.CHECKSUM || expect !== (reply.CHECKSUM || '')) {
-      console.error('Checksum mismatch from PayGate reply', { expect, got: reply.CHECKSUM });
-      return res.status(400).json({ success: false, message: 'Checksum mismatch from PayGate', reply });
+      payload.LOCALE = v.locale;
+      payload.COUNTRY = v.country;
+      if (v.includeNotify) payload.NOTIFY_URL = NOTIFY_URL || '';
+
+      // Build checksum values in canonical order; allow excluding RETURN_URL if variant requests it.
+      const checksumValues = [];
+      checksumValues.push(payload.PAYGATE_ID);
+      checksumValues.push(payload.REFERENCE);
+      checksumValues.push(String(payload.AMOUNT));
+      checksumValues.push(payload.CURRENCY);
+      if (!v.excludeReturn) checksumValues.push(payload.RETURN_URL);
+      checksumValues.push(payload.TRANSACTION_DATE);
+      checksumValues.push(payload.LOCALE);
+      checksumValues.push(payload.COUNTRY);
+      checksumValues.push(payload.EMAIL);
+      if (v.includeNotify) checksumValues.push(payload.NOTIFY_URL || '');
+
+      const canonical = checksumValues.join('');
+      payload.CHECKSUM = md5Hex(canonical + (process.env.PAYGATE_ENCRYPTION_KEY || ''));
+      const body = new URLSearchParams(payload).toString();
+
+      console.log('PayWeb3 initiate attempt', v.name, { payloadSummary: { REFERENCE: payload.REFERENCE, AMOUNT: payload.AMOUNT, TRANSACTION_DATE: payload.TRANSACTION_DATE, RETURN_URL: v.excludeReturn ? '[excluded]' : payload.RETURN_URL, NOTIFY_URL: v.includeNotify ? payload.NOTIFY_URL : '[excluded]' }, canonical, checksum: payload.CHECKSUM });
+
+      try {
+        const r = await fetch('https://secure.paygate.co.za/payweb3/initiate.trans', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body
+        });
+        const text = await r.text();
+        const reply = Object.fromEntries(new URLSearchParams(text));
+  attempts.push({ variant: v.name, status: r.status, reply, bodySent: body, canonical });
+
+        // If PayGate returns an obvious error, try next variant
+        if (reply && reply.CHECKSUM) {
+          const expect = payweb3Checksum([reply.PAYGATE_ID || '', reply.PAY_REQUEST_ID || '', reply.REFERENCE || '']);
+          if (expect === reply.CHECKSUM) {
+            finalReply = reply;
+            console.log('PayWeb3 initiate successful with variant', v.name, { reply });
+            break;
+          } else {
+            console.warn('Reply checksum mismatch for variant', v.name, { expect, got: reply.CHECKSUM });
+            // continue to next variant
+          }
+        } else {
+          // No CHECKSUM in reply (likely ERROR), log and continue
+          console.warn('PayGate reply missing CHECKSUM for variant', v.name, reply || text);
+        }
+      } catch (err) {
+        console.error('Error posting to PayGate initiate for variant', v.name, err && err.message);
+        attempts.push({ variant: v.name, error: err && err.message });
+      }
     }
 
-    return res.json({ success: true, processUrl: 'https://secure.paygate.co.za/payweb3/process.trans', fields: { PAY_REQUEST_ID: reply.PAY_REQUEST_ID, CHECKSUM: reply.CHECKSUM } });
+    if (!finalReply) {
+      const last = attempts.length ? attempts[attempts.length - 1] : null;
+      console.error('All PayWeb3 initiate attempts failed', { attempts });
+      return res.status(400).json({ success: false, message: 'Checksum mismatch from PayGate or DATA_CHK', attempts });
+    }
+
+    return res.json({ success: true, processUrl: 'https://secure.paygate.co.za/payweb3/process.trans', fields: { PAY_REQUEST_ID: finalReply.PAY_REQUEST_ID, CHECKSUM: finalReply.CHECKSUM }, debug: { attempts } });
   } catch (e) {
     console.error('Error in /paygate/initiate:', e && e.message);
     return res.status(500).json({ success: false, message: e && e.message });
