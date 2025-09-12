@@ -7,17 +7,47 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 
 // Middleware
+// CORS - allow Vercel frontend and local dev. FRONTEND_URL env can be set to your Vercel domain.
+const FRONTEND_URL = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_API_URL || 'https://capsaicin-frontend.vercel.app'
 app.use(cors({
-  origin: [
-    'http://localhost:3001', 
-    'http://localhost:4000', 
-    'https://capsaicin-frontend.vercel.app',
-    'https://capsaicin-ecommerce.vercel.app',
-    'https://your-vercel-app.vercel.app' // Replace with your actual Vercel domain
-  ],
+  origin: (origin, cb) => {
+    // allow server-to-server requests (no origin)
+    if (!origin) return cb(null, true)
+    const allowed = [
+      'http://localhost:3000',
+      'http://localhost:3001',
+      FRONTEND_URL,
+    ]
+    if (allowed.includes(origin)) return cb(null, true)
+    return cb(new Error('CORS not allowed'), false)
+  },
   credentials: true
-}));
-app.use(express.json());
+}))
+
+// Parse JSON and URL-encoded bodies
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
+
+// Optional verbose request logger to help diagnose empty payloads/timeouts
+// Set VERBOSE_REQUESTS=1 in your environment (Render env) to enable.
+app.use((req, res, next) => {
+  const verbose = String(process.env.VERBOSE_REQUESTS || '').trim() === '1'
+  if (!verbose) return next()
+
+  const start = Date.now()
+  let bodyBytes = 0
+  req.on && req.on('data', (chunk) => { try { bodyBytes += chunk.length } catch (e) {} })
+
+  res.on('finish', () => {
+    const ms = Date.now() - start
+    const method = req.method
+    const url = req.originalUrl || req.url
+    const status = res.statusCode
+    console.log(`VERBOSE: ${method} ${url} ${bodyBytes}-byte payload - ${status} ${ms}ms`)
+  })
+
+  next()
+})
 
 // Mount PayGate routes
 try {
@@ -29,9 +59,10 @@ try {
 }
 
 // MongoDB connection
-mongoose.connect(process.env.MONGODB_URI)
+// Connect to MongoDB with a reasonable serverSelectionTimeout so failures fail fast in production
+mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 5000 })
 .then(() => console.log('Connected to MongoDB'))
-.catch(err => console.error('MongoDB connection error:', err));
+.catch(err => console.error('MongoDB connection error:', err && err.message ? err.message : err));
 
 // Invoice Schema
 const invoiceSchema = new mongoose.Schema({
@@ -183,6 +214,20 @@ app.post('/invoices', async (req, res) => {
       notes
     } = req.body;
 
+    // If backend TEST_PRODUCT_ID is configured, force shipping_cost to 0 when any item matches
+    const TEST_PRODUCT_ID_BACKEND = (process.env.TEST_PRODUCT_ID || '').trim()
+    let finalShippingCost = shipping_cost
+    try {
+      if (TEST_PRODUCT_ID_BACKEND && Array.isArray(items)) {
+        const hasTest = items.some(it => String(it.id) === TEST_PRODUCT_ID_BACKEND || String(it._id || '') === TEST_PRODUCT_ID_BACKEND || /test/i.test(String(it.id)) || /test/i.test(String(it.name)))
+        if (hasTest) {
+          finalShippingCost = 0
+        }
+      }
+    } catch (err) {
+      console.warn('Error checking test product id for invoice shipping override', err.message || err)
+    }
+
     const invoice = new Invoice({
       invoice_number: generateInvoiceNumber(),
       customer_name,
@@ -191,7 +236,7 @@ app.post('/invoices', async (req, res) => {
       customer_address: customer_address || '',
       items,
       subtotal,
-      shipping_cost,
+      shipping_cost: finalShippingCost,
       total,
       shipping_method: shipping_method || 'Standard Delivery',
       notes: notes || ''
@@ -342,7 +387,10 @@ app.post('/admin/login', async (req, res) => {
 // Product Routes (existing functionality)
 app.get('/products', async (req, res) => {
   try {
-    const products = await Product.find();
+  const start = Date.now()
+  const products = await Product.find();
+  const took = Date.now() - start
+  console.log(`Fetched products in ${took}ms`)
     // Transform products to include id field for frontend compatibility
     const transformedProducts = products.map(product => ({
       ...product.toObject(),
@@ -350,11 +398,12 @@ app.get('/products', async (req, res) => {
     }));
     res.json(transformedProducts);
   } catch (error) {
-    console.error('Error fetching products:', error);
-    res.status(500).json({
+    console.error('Error fetching products:', error && error.message ? error.message : error);
+    const isTimeout = error && (String(error.message).toLowerCase().includes('timeout') || String(error.message).toLowerCase().includes('timed out'))
+    res.status(isTimeout ? 504 : 500).json({
       success: false,
-      message: 'Failed to fetch products',
-      error: error.message
+      message: isTimeout ? 'Database timeout - please try again later' : 'Failed to fetch products',
+      error: error && error.message ? error.message : String(error)
     });
   }
 });
@@ -453,7 +502,14 @@ app.delete('/products/:id', async (req, res) => {
   }
 });
 
-// Start server
-app.listen(PORT, () => {
+// Start server with increased timeout
+const server = app.listen(PORT, () => {
   console.log(`Express server running at http://localhost:${PORT}`);
-});
+})
+
+// Increase server timeout so Render doesn't kill longer requests (120s)
+try {
+  server.setTimeout(120000)
+} catch (e) {
+  console.warn('Unable to set server timeout:', e && e.message)
+}

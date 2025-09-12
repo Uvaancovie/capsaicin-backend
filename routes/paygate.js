@@ -69,6 +69,12 @@ router.post('/paygate/notify', express.urlencoded({ extended: true }), async (re
 // Create endpoint - server signs payload for PayGate
 router.post('/paygate/create', express.json(), async (req, res) => {
   try {
+    console.log('Incoming /paygate/create request headers:', {
+      origin: req.headers.origin,
+      'content-type': req.headers['content-type'],
+      'user-agent': req.headers['user-agent']
+    })
+    console.log('Incoming /paygate/create body:', req.body)
     const { orderId, amountRands, currency = 'ZAR', description = '' } = req.body || {};
 
     if (!orderId || !amountRands) {
@@ -123,4 +129,47 @@ router.post('/paygate/create', express.json(), async (req, res) => {
   }
 });
 
+
+  // Forward endpoint - avoid CORS by navigating to this backend URL which returns an auto-submitting form
+  router.get('/paygate/forward', (req, res) => {
+    try {
+      // Accept fields via query params for quick debugging (not secure for production)
+      const paygateEndpoint = (req.query.endpoint || 'https://secure.paygate.co.za/paypage');
+      const params = Object.assign({}, req.query);
+      // Build form inputs
+      const inputs = Object.keys(params).filter(k => k !== 'endpoint').map(k => {
+        const v = String(params[k] || '').replace(/"/g, '&quot;');
+        return `<input type="hidden" name="${k}" value="${v}"/>`;
+      }).join('\n');
+
+      const html = `<!doctype html><html><head><meta charset="utf-8"><title>PayGate Forward</title></head><body><form id="f" method="POST" action="${paygateEndpoint}">\n${inputs}\n</form><script>document.getElementById('f').submit();</script></body></html>`;
+      res.set('Content-Type', 'text/html');
+      return res.status(200).send(html);
+    } catch (e) {
+      console.error('Error in /paygate/forward:', e && e.message);
+      return res.status(500).send('ERROR');
+    }
+  });
+
+  // Optional POST forward that returns auto-submitting HTML (accepts JSON body or form)
+  router.post('/paygate/forward', express.urlencoded({ extended: true }), async (req, res) => {
+    try {
+      const params = req.body || {};
+      const paygateEndpoint = params.endpoint || 'https://secure.paygate.co.za/paypage';
+      const inputs = Object.keys(params).filter(k => k !== 'endpoint').map(k => {
+        const v = String(params[k] || '').replace(/"/g, '&quot;');
+        return `<input type="hidden" name="${k}" value="${v}"/>`;
+      }).join('\n');
+
+      const html = `<!doctype html><html><head><meta charset="utf-8"><title>PayGate Forward</title></head><body><form id="f" method="POST" action="${paygateEndpoint}">\n${inputs}\n</form><script>document.getElementById('f').submit();</script></body></html>`;
+      res.set('Content-Type', 'text/html');
+      return res.status(200).send(html);
+    } catch (e) {
+      console.error('Error in /paygate/forward POST:', e && e.message);
+      return res.status(500).send('ERROR');
+    }
+  });
+
 module.exports = router;
+
+// NOTE: the file previously exported router above; append forwarding helpers below
