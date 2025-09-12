@@ -505,6 +505,7 @@ app.delete('/products/:id', async (req, res) => {
 // Start server with increased timeout
 const server = app.listen(PORT, () => {
   console.log(`Express server running at http://localhost:${PORT}`);
+  console.log("PAYGATE key hint:", (process.env.PAYGATE_ENCRYPTION_KEY||"").replace(/^(.).*(.)$/,"$1***$2"));
 })
 
 // Increase server timeout so Render doesn't kill longer requests (120s)
