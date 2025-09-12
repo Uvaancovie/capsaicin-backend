@@ -2,6 +2,83 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 
+// Helper for MD5 checksum used by PayWeb3
+function md5Hex(s) {
+  return crypto.createHash('md5').update(s).digest('hex');
+}
+
+function payweb3Checksum(values = []) {
+  // PayWeb3: concatenate values (no separators) then append the encryption key
+  const key = process.env.PAYGATE_ENCRYPTION_KEY || '';
+  return md5Hex(values.join('') + key);
+}
+
+// PayWeb3 initiate endpoint (server-to-server). Returns process URL and fields.
+router.post('/paygate/initiate', express.json(), async (req, res) => {
+  try {
+    const { orderId, amountRands, email = '' } = req.body || {};
+    if (!orderId || !amountRands) return res.status(400).json({ success: false, message: 'orderId & amountRands required' });
+
+    const PAYGATE_ID = process.env.PAYGATE_ID || '';
+    const RETURN_URL = process.env.PAYGATE_RETURN_URL || '';
+    const NOTIFY_URL = process.env.PAYGATE_NOTIFY_URL || '';
+
+    const payload = {
+      PAYGATE_ID,
+      REFERENCE: String(orderId),
+      AMOUNT: String(Math.round(Number(amountRands) * 100)), // cents
+      CURRENCY: 'ZAR',
+      RETURN_URL,
+      TRANSACTION_DATE: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      LOCALE: 'en-za',
+      COUNTRY: 'ZAF',
+      EMAIL: email || '',
+      NOTIFY_URL: NOTIFY_URL || ''
+    };
+
+    // Build checksum in documented order. Include NOTIFY_URL if present.
+    const checksumValues = [
+      payload.PAYGATE_ID,
+      payload.REFERENCE,
+      String(payload.AMOUNT),
+      payload.CURRENCY,
+      payload.RETURN_URL,
+      payload.TRANSACTION_DATE,
+      payload.LOCALE,
+      payload.COUNTRY,
+      payload.EMAIL,
+      payload.NOTIFY_URL || ''
+    ];
+
+    payload.CHECKSUM = payweb3Checksum(checksumValues);
+
+    // Post to PayWeb3 initiate.trans
+    const body = new URLSearchParams(payload).toString();
+    const fetch = global.fetch || require('node-fetch');
+    const r = await fetch('https://secure.paygate.co.za/payweb3/initiate.trans', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+
+    const text = await r.text();
+    // PayGate returns key=value&...; parse
+    const reply = Object.fromEntries(new URLSearchParams(text));
+
+    // Verify reply checksum
+    const expect = payweb3Checksum([reply.PAYGATE_ID || '', reply.PAY_REQUEST_ID || '', reply.REFERENCE || '']);
+    if (!reply.CHECKSUM || expect !== (reply.CHECKSUM || '')) {
+      console.error('Checksum mismatch from PayGate reply', { expect, got: reply.CHECKSUM });
+      return res.status(400).json({ success: false, message: 'Checksum mismatch from PayGate', reply });
+    }
+
+    return res.json({ success: true, processUrl: 'https://secure.paygate.co.za/payweb3/process.trans', fields: { PAY_REQUEST_ID: reply.PAY_REQUEST_ID, CHECKSUM: reply.CHECKSUM } });
+  } catch (e) {
+    console.error('Error in /paygate/initiate:', e && e.message);
+    return res.status(500).json({ success: false, message: e && e.message });
+  }
+});
+
 // Health endpoint
 router.get('/paygate/health', (req, res) => {
   res.json({ success: true, message: 'PayGate route healthy' });
@@ -169,6 +246,56 @@ router.post('/paygate/create', express.json(), async (req, res) => {
       return res.status(500).send('ERROR');
     }
   });
+
+// Proxy endpoint - server-side POST to PayGate for debugging (returns status, headers and body)
+router.post('/paygate/proxy', express.json(), async (req, res) => {
+  try {
+    const params = req.body && req.body.fields ? req.body.fields : (req.body || {});
+    const endpoint = req.body && req.body.endpoint ? req.body.endpoint : 'https://secure.paygate.co.za/paypage';
+
+    // Build form-encoded body
+    const formEntries = Object.keys(params).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(String(params[k] || ''))).join('&');
+
+    // Use native https/https request to avoid extra deps
+    const url = require('url');
+    const parsed = url.parse(endpoint);
+    const https = parsed.protocol === 'https:' ? require('https') : require('http');
+
+    const requestOptions = {
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: parsed.path || parsed.pathname || '/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(formEntries),
+        // set a sensible User-Agent
+        'User-Agent': req.headers['user-agent'] || 'Capsaicin-Server/1.0'
+      }
+    };
+
+    // Perform request
+    const proxyResp = await new Promise((resolve, reject) => {
+      const r = https.request(requestOptions, (resp) => {
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          resolve({ statusCode: resp.statusCode, headers: resp.headers, body });
+        });
+      });
+      r.on('error', (err) => reject(err));
+      r.write(formEntries);
+      r.end();
+    });
+
+    // Return proxied response for debugging
+    return res.status(200).json({ ok: true, proxied: proxyResp });
+  } catch (e) {
+    console.error('Error in /paygate/proxy:', e && e.message);
+    return res.status(500).json({ ok: false, message: e && e.message });
+  }
+});
 
 module.exports = router;
 
