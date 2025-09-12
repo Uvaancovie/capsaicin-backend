@@ -19,6 +19,15 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Mount PayGate routes
+try {
+  const paygateRoutes = require('./routes/paygate');
+  app.use(paygateRoutes);
+  console.log('Mounted paygate routes');
+} catch (err) {
+  console.warn('Paygate routes not mounted (file may be missing):', err.message);
+}
+
 // MongoDB connection
 mongoose.connect(process.env.MONGODB_URI)
 .then(() => console.log('Connected to MongoDB'))
