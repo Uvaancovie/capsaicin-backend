@@ -58,6 +58,15 @@ try {
   console.warn('Paygate routes not mounted (file may be missing):', err.message);
 }
 
+// Mount Ozow routes
+try {
+  const ozowRoutes = require('./routes/ozow');
+  app.use(ozowRoutes);
+  console.log('Mounted ozow routes');
+} catch (err) {
+  console.warn('Ozow routes not mounted (file may be missing):', err.message);
+}
+
 // MongoDB connection
 // Connect to MongoDB with a reasonable serverSelectionTimeout so failures fail fast in production
 mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 5000 })
