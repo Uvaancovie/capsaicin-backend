@@ -28,6 +28,16 @@ router.post('/ozow/initiate', express.json(), async (req, res) => {
     };
 
     const privateKey = process.env.OZOW_PRIVATE_KEY || '';
+      // Log the fields we will send (safe: doesn't include private key)
+      try {
+        console.log('Ozow fields (no private key):', JSON.stringify(fields));
+      } catch (e) {}
+      // Log short hints (safe) to help verify environment values without printing secrets
+      try {
+        console.log('OZOW_SITE_CODE:', String(process.env.OZOW_SITE_CODE || ''));
+        const pk = String(privateKey || '');
+        console.log('OZOW_PRIVATE_KEY hint:', pk ? `${pk.slice(0,4)}...${pk.slice(-4)}` : '(none)');
+      } catch (e) {}
       // Log canonical source used to compute HashCheck for debugging
       const srcForLog = [
         'SiteCode','CountryCode','CurrencyCode','Amount','TransactionReference','BankReference',
