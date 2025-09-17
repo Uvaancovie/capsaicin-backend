@@ -8,7 +8,13 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors({
-  origin: ['http://localhost:3001', 'http://localhost:3000', 'https://capsaicin-frontend.vercel.app'],
+  origin: [
+    'http://localhost:3001',
+    'http://localhost:3000',
+    'https://capsaicin-frontend.vercel.app',
+    'https://www.capepharm.co.za',
+    'https://capepharm.co.za'
+  ],
   credentials: true
 }));
 app.use(express.json());
