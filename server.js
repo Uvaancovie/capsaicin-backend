@@ -27,16 +27,16 @@ app.use(cors({
       ...allowedFrontends,
     ]
     if (allowed.includes(origin)) return cb(null, true)
-    return cb(new Error('CORS not allowed'), false)
-  },
-  credentials: true
-}))
 
-app.use(cors({
-  origin: (origin, cb) => {
-    // allow server-to-server requests (no origin)
-    if (!origin) return cb(null, true)
-    if (allowedOrigins.includes(origin)) return cb(null, true)
+    // Allow any subdomain or www for capepharm.co.za if needed
+    try {
+      const parsed = new URL(origin)
+      const hostname = parsed.hostname || ''
+      if (hostname === 'capepharm.co.za' || hostname.endsWith('.capepharm.co.za')) return cb(null, true)
+    } catch (e) {
+      // ignore URL parse errors
+    }
+
     console.warn('CORS origin denied:', origin)
     return cb(new Error('CORS not allowed'), false)
   },
