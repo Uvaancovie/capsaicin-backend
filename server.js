@@ -7,8 +7,16 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 
 // Middleware
-// CORS - allow Vercel frontend and local dev. FRONTEND_URL env can be set to your Vercel domain.
+// CORS - allow configured frontends and local dev. Use FRONTEND_URL or FRONTEND_URLS (comma-separated)
+// CORS - allow configured frontend origins and local dev.
+// You can set FRONTEND_URL (single) or FRONTEND_URLS (comma-separated list) in Render env.
 const FRONTEND_URL = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_API_URL || 'https://capsaicin-frontend.vercel.app'
+const FRONTEND_URLS = process.env.FRONTEND_URLS || ''
+// Build allowed list: local dev hosts + any configured frontend URLs
+const allowedFrontends = FRONTEND_URLS
+  ? FRONTEND_URLS.split(',').map(s => s.trim()).filter(Boolean)
+  : [FRONTEND_URL]
+
 app.use(cors({
   origin: (origin, cb) => {
     // allow server-to-server requests (no origin)
@@ -16,9 +24,20 @@ app.use(cors({
     const allowed = [
       'http://localhost:3000',
       'http://localhost:3001',
-      FRONTEND_URL,
+      ...allowedFrontends,
     ]
     if (allowed.includes(origin)) return cb(null, true)
+    return cb(new Error('CORS not allowed'), false)
+  },
+  credentials: true
+}))
+
+app.use(cors({
+  origin: (origin, cb) => {
+    // allow server-to-server requests (no origin)
+    if (!origin) return cb(null, true)
+    if (allowedOrigins.includes(origin)) return cb(null, true)
+    console.warn('CORS origin denied:', origin)
     return cb(new Error('CORS not allowed'), false)
   },
   credentials: true
