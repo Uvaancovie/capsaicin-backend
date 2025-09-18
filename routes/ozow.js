@@ -66,7 +66,18 @@ router.post('/ozow/notify', express.urlencoded({ extended: true }), async (req, 
     const ok = verifyOzowHash(payload, receivedHash, privateKey);
     if (!ok) {
       console.warn('Ozow notify hash mismatch', { payload, receivedHash });
-      // still respond 200 to not keep Ozow retrying — but log for investigation
+      // Persist webhook failure for investigation and retry
+      try {
+        const mongoose = require('mongoose');
+        const WebhookFailure = mongoose.models && (mongoose.models.WebhookFailure || (mongoose.model && mongoose.model('WebhookFailure')));
+        if (WebhookFailure) {
+          await WebhookFailure.create({ provider: 'ozow', payload, reason: 'hash_mismatch', retries: 0 });
+          console.log('Logged webhook failure for hash mismatch');
+        }
+      } catch (e) {
+        console.warn('Failed to log webhook failure', e && e.message);
+      }
+      // respond 200 so Ozow does not keep retrying on our transient issues
       res.set('Content-Type', 'text/plain');
       return res.status(200).send('OK');
     }
@@ -94,12 +105,36 @@ router.post('/ozow/notify', express.urlencoded({ extended: true }), async (req, 
           console.log('Invoice updated from Ozow notify for', transactionRef);
         } else {
           console.warn('Invoice update did not match any documents for', transactionRef, result);
+          // log webhook failure for missing invoice
+          try {
+            const WebhookFailure = mongoose.models && (mongoose.models.WebhookFailure || (mongoose.model && mongoose.model('WebhookFailure')));
+            if (WebhookFailure) {
+              await WebhookFailure.create({ provider: 'ozow', payload, reason: 'invoice_not_found', retries: 0 });
+              console.log('Logged webhook failure for missing invoice');
+            }
+          } catch (e) {
+            console.warn('Failed to log webhook failure for missing invoice', e && e.message);
+          }
         }
       } else {
         console.warn('Invoice model not available or missing transactionRef');
+        try {
+          const mongoose = require('mongoose');
+          const WebhookFailure = mongoose.models && (mongoose.models.WebhookFailure || (mongoose.model && mongoose.model('WebhookFailure')));
+          if (WebhookFailure) {
+            await WebhookFailure.create({ provider: 'ozow', payload, reason: 'invoice_model_unavailable', retries: 0 });
+          }
+        } catch (e) {}
       }
     } catch (e) {
       console.warn('Invoice update skipped due to error:', e && e.message);
+      try {
+        const mongoose = require('mongoose');
+        const WebhookFailure = mongoose.models && (mongoose.models.WebhookFailure || (mongoose.model && mongoose.model('WebhookFailure')));
+        if (WebhookFailure) {
+          await WebhookFailure.create({ provider: 'ozow', payload, reason: `update_error:${e && e.message ? String(e.message).slice(0,200) : 'unknown'}`, retries: 0 });
+        }
+      } catch (ie) {}
     }
     res.set('Content-Type', 'text/plain');
     return res.status(200).send('OK');

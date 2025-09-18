@@ -87,6 +87,17 @@ const invoiceSchema = new mongoose.Schema({
 
 const Invoice = mongoose.model('Invoice', invoiceSchema);
 
+// Webhook failure tracking for observability and retries
+const webhookFailureSchema = new mongoose.Schema({
+  provider: { type: String, required: true },
+  payload: { type: Object, required: true },
+  reason: { type: String, required: true },
+  retries: { type: Number, default: 0 },
+  processed: { type: Boolean, default: false },
+}, { timestamps: true });
+
+const WebhookFailure = mongoose.model('WebhookFailure', webhookFailureSchema);
+
 // Product Schema (existing)
 const productSchema = new mongoose.Schema({
   name: {
@@ -213,6 +224,16 @@ app.get('/invoices', async (req, res) => {
       message: 'Failed to fetch invoices',
       error: error.message
     });
+  }
+});
+
+// Expose webhook failures for admin inspection (simple, unprotected)
+app.get('/webhook-failures', async (req, res) => {
+  try {
+    const failures = await WebhookFailure.find().sort({ createdAt: -1 }).limit(100);
+    res.json(failures);
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Failed to fetch webhook failures', error: e.message });
   }
 });
 
