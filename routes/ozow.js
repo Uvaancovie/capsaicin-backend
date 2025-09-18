@@ -15,12 +15,19 @@ router.post('/ozow/initiate', express.json(), async (req, res) => {
     const normalizeUrl = (u) => {
       if (!u) return u;
       try {
-        // If it already has a scheme, return as-is
-        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(u)) return u;
-        // If it starts with // treat as protocol-relative and prepend https:
-        if (/^\/\//.test(u)) return `https:${u}`;
-        // Otherwise assume missing scheme and prepend https://
-        return `https://${u}`;
+        let s = String(u).trim();
+        // If it already explicitly declares a scheme like 'http:', 'https:', 'mailto:', etc., return as-is
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) return s;
+
+        // Remove any leading http(s)://, //, or :// so we don't accidentally create 'https://://...'
+        // Examples handled: 'https://example', '//example', '://example', 'http://example'
+        s = s.replace(/^(https?:)?:\/\//i, ''); // remove leading http(s):// or ://
+        s = s.replace(/^\/\//, ''); // remove leading // if any left
+        // Remove leading colons or slashes left-over
+        s = s.replace(/^[:\/]+/, '');
+
+        // Finally ensure it has https://
+        return `https://${s}`;
       } catch (e) {
         return u;
       }
@@ -57,6 +64,31 @@ router.post('/ozow/initiate', express.json(), async (req, res) => {
       NotifyUrl,
       IsTest: (process.env.OZOW_IS_TEST || 'false').toString()
     };
+
+    // Final sanitization: collapse accidental duplicate schemes like 'https://://example'
+    const sanitizeOutgoingUrl = (u) => {
+      if (!u) return u;
+      try {
+        let s = String(u);
+        // Replace occurrences like 'https://://' or 'https:////' with a single 'https://'
+        s = s.replace(/https?:\/\/:\/\//i, 'https://');
+        s = s.replace(/https?:\/\//i, (m) => m.toLowerCase());
+        // Collapse repeated sequences of '://'
+        s = s.replace(/:\/\/:\/\//g, '://');
+        // If somehow we still have 'https://://', collapse
+        s = s.replace(/https?:\/\:\/\//i, 'https://');
+        // Remove stray duplicate protocols like 'https://https://' -> 'https://'
+        s = s.replace(/^(https?:\/\/)+/i, 'https://');
+        return s;
+      } catch (e) {
+        return u;
+      }
+    };
+
+    fields.CancelUrl = sanitizeOutgoingUrl(fields.CancelUrl);
+    fields.ErrorUrl = sanitizeOutgoingUrl(fields.ErrorUrl);
+    fields.SuccessUrl = sanitizeOutgoingUrl(fields.SuccessUrl);
+    fields.NotifyUrl = sanitizeOutgoingUrl(fields.NotifyUrl);
 
     const privateKey = process.env.OZOW_PRIVATE_KEY || '';
       // Log the fields we will send (safe: doesn't include private key)
