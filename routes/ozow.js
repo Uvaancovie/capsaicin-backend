@@ -49,6 +49,7 @@ router.post('/ozow/initiate', express.json(), async (req, res) => {
       console.warn({ cancelUrlRaw, errorUrlRaw, successUrlRaw, notifyUrlRaw, CancelUrl, ErrorUrl, SuccessUrl, NotifyUrl });
     }
 
+    // Build minimal fields. Do NOT include Optional1..Optional5 unless they are explicitly provided.
     const fields = {
       SiteCode: process.env.OZOW_SITE_CODE,
       CountryCode: process.env.OZOW_COUNTRY_CODE || 'ZA',
@@ -56,14 +57,23 @@ router.post('/ozow/initiate', express.json(), async (req, res) => {
       Amount: amount,
       TransactionReference: String(orderId),
       BankReference: String(bankRef || orderId).slice(0, 20),
-      Optional1: '', Optional2: '', Optional3: '', Optional4: '', Optional5: '',
-      Customer: customer || '',
+      // Customer should be concise and avoid angle-brackets which can confuse some processors
+      Customer: (typeof customer === 'string' ? String(customer).replace(/[<>]/g, '') : String(customer || 'customer')),
       CancelUrl,
       ErrorUrl,
       SuccessUrl,
       NotifyUrl,
-      IsTest: (process.env.OZOW_IS_TEST || 'false').toString()
+      IsTest: (String(process.env.OZOW_IS_TEST || 'false')).toLowerCase() === 'true' ? 'true' : 'false'
     };
+
+    // If optional values are explicitly provided (e.g., in req.body or env), attach them.
+    // This avoids including empty Optional1..5 keys in the hash when they are not posted.
+    ['Optional1','Optional2','Optional3','Optional4','Optional5'].forEach((opt) => {
+      const v = (req.body && (req.body[opt] || req.body[opt.toLowerCase()])) || process.env[`OZOW_${opt.toUpperCase()}`];
+      if (typeof v !== 'undefined' && v !== null && String(v).trim() !== '') {
+        fields[opt] = String(v);
+      }
+    });
 
     // Final sanitization: collapse accidental duplicate schemes like 'https://://example'
     const sanitizeOutgoingUrl = (u) => {
@@ -102,14 +112,21 @@ router.post('/ozow/initiate', express.json(), async (req, res) => {
         console.log('OZOW_PRIVATE_KEY hint:', pk ? `${pk.slice(0,4)}...${pk.slice(-4)}` : '(none)');
       } catch (e) {}
       // Log canonical source used to compute HashCheck for debugging
-      const srcForLog = [
+      // Build the exact ordered concat string used for the HashCheck based on OZOW_ORDER in lib/ozowHash.js
+      const orderedForLog = [
         'SiteCode','CountryCode','CurrencyCode','Amount','TransactionReference','BankReference',
         'Optional1','Optional2','Optional3','Optional4','Optional5','Customer',
         'CancelUrl','ErrorUrl','SuccessUrl','NotifyUrl','IsTest'
-      ].filter(k => Object.prototype.hasOwnProperty.call(fields, k)).map(k => String(fields[k] ?? '')).join('') + privateKey;
+      ];
+      const srcForLog = orderedForLog.filter(k => Object.prototype.hasOwnProperty.call(fields, k)).map(k => String(fields[k] ?? '')).join('') + privateKey;
       console.log('Ozow concat src (lowercased):', String(srcForLog).toLowerCase());
       fields.HashCheck = buildOzowHash(fields, privateKey);
       console.log('Ozow HashCheck:', fields.HashCheck);
+
+      // Also show which field names will be POSTed to Ozow (order not guaranteed in JSON)
+      try {
+        console.log('POST fields to Ozow:', Object.keys(fields).join(','));
+      } catch (e) {}
 
     // Return the action and fields to the client so they can auto-submit to https://pay.ozow.com
     return res.json({ action: 'https://pay.ozow.com', method: 'POST', fields });
@@ -243,6 +260,40 @@ router.post('/ozow/forward', express.urlencoded({ extended: true }), async (req,
   } catch (e) {
     console.error('Error in /ozow/forward POST:', e && e.message);
     return res.status(500).send('ERROR');
+  }
+});
+
+// POST /ozow/debug-post - Debug helper: server-side POST to Ozow and return raw response
+// Accepts JSON body with fields (same as /ozow/initiate.fields) or x-www-form-urlencoded.
+// Protect with OZOW_DEBUG_TOKEN env var if set: provide header 'x-debug-token: <token>'
+router.post('/ozow/debug-post', express.json(), async (req, res) => {
+  try {
+    const debugToken = process.env.OZOW_DEBUG_TOKEN || '';
+    const provided = req.headers['x-debug-token'] || req.query.token || '';
+    if (debugToken && String(provided) !== String(debugToken)) {
+      return res.status(403).json({ success: false, message: 'Forbidden - invalid debug token' });
+    }
+
+    const fields = req.body.fields && Object.keys(req.body.fields).length ? req.body.fields : (req.body || {});
+    if (!fields || Object.keys(fields).length === 0) return res.status(400).json({ success: false, message: 'No fields provided' });
+
+    const ozowEndpoint = 'https://pay.ozow.com';
+    // Build form body
+    const params = new URLSearchParams();
+    Object.keys(fields).forEach(k => params.append(k, String(fields[k] ?? '')));
+
+    const r = await fetch(ozowEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+
+    const text = await r.text();
+    // Return status and body for debugging (do not log secrets)
+    res.status(200).json({ success: true, status: r.status, body: text.substring(0, 200000) });
+  } catch (e) {
+    console.error('Error in /ozow/debug-post:', e && e.message);
+    res.status(500).json({ success: false, message: e && e.message });
   }
 });
 
