@@ -11,6 +11,37 @@ router.post('/ozow/initiate', express.json(), async (req, res) => {
     if (!orderId || !amountRands) return res.status(400).json({ success: false, message: 'orderId & amountRands required' });
 
     const amount = Number(amountRands).toFixed(2); // 2 decimal string
+    // Normalize and validate URLs from env to avoid malformed values like "://..."
+    const normalizeUrl = (u) => {
+      if (!u) return u;
+      try {
+        // If it already has a scheme, return as-is
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(u)) return u;
+        // If it starts with // treat as protocol-relative and prepend https:
+        if (/^\/\//.test(u)) return `https:${u}`;
+        // Otherwise assume missing scheme and prepend https://
+        return `https://${u}`;
+      } catch (e) {
+        return u;
+      }
+    };
+
+    const cancelUrlRaw = process.env.OZOW_CANCEL_URL || '';
+    const errorUrlRaw = process.env.OZOW_ERROR_URL || '';
+    const successUrlRaw = process.env.OZOW_SUCCESS_URL || '';
+    const notifyUrlRaw = process.env.OZOW_NOTIFY_URL || '';
+
+    const CancelUrl = normalizeUrl(cancelUrlRaw);
+    const ErrorUrl = normalizeUrl(errorUrlRaw);
+    const SuccessUrl = normalizeUrl(successUrlRaw);
+    const NotifyUrl = normalizeUrl(notifyUrlRaw);
+
+    // If normalization changed anything, log a helpful warning so env can be corrected
+    if (CancelUrl !== cancelUrlRaw || ErrorUrl !== errorUrlRaw || SuccessUrl !== successUrlRaw || NotifyUrl !== notifyUrlRaw) {
+      console.warn('One or more OZOW URL env values were normalized. Please update your environment to include full URLs (including https://).');
+      console.warn({ cancelUrlRaw, errorUrlRaw, successUrlRaw, notifyUrlRaw, CancelUrl, ErrorUrl, SuccessUrl, NotifyUrl });
+    }
+
     const fields = {
       SiteCode: process.env.OZOW_SITE_CODE,
       CountryCode: process.env.OZOW_COUNTRY_CODE || 'ZA',
@@ -20,10 +51,10 @@ router.post('/ozow/initiate', express.json(), async (req, res) => {
       BankReference: String(bankRef || orderId).slice(0, 20),
       Optional1: '', Optional2: '', Optional3: '', Optional4: '', Optional5: '',
       Customer: customer || '',
-      CancelUrl: process.env.OZOW_CANCEL_URL,
-      ErrorUrl: process.env.OZOW_ERROR_URL,
-      SuccessUrl: process.env.OZOW_SUCCESS_URL,
-      NotifyUrl: process.env.OZOW_NOTIFY_URL,
+      CancelUrl,
+      ErrorUrl,
+      SuccessUrl,
+      NotifyUrl,
       IsTest: (process.env.OZOW_IS_TEST || 'false').toString()
     };
 
