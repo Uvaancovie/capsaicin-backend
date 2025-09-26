@@ -154,6 +154,15 @@ const Invoice = mongoose.model('Invoice', invoiceSchema);
 
 // Product Schema (existing)
 const productSchema = new mongoose.Schema({
+  // SKU: if your DB has a unique index on sku, ensure we always provide one.
+  sku: {
+    type: String,
+    required: false,
+    // no unique here to avoid index re-creation if existing index differs; we will generate unique SKUs
+    default: function() {
+      return `SKU-${Date.now().toString(36)}-${Math.random().toString(36).substring(2,8).toUpperCase()}`;
+    }
+  },
   name: {
     type: String,
     required: true
@@ -439,8 +448,24 @@ app.get('/products', async (req, res) => {
 app.post('/products', async (req, res) => {
   try {
     console.log('Creating new product:', req.body);
-    const product = new Product(req.body);
-    const savedProduct = await product.save();
+    const input = Object.assign({}, req.body || {});
+    // If sku is missing or explicitly null/empty, generate one to avoid duplicate-key issues on sku index
+    if (!input.sku || String(input.sku).trim() === '') {
+      input.sku = `SKU-${Date.now().toString(36)}-${Math.random().toString(36).substring(2,8).toUpperCase()}`;
+    }
+    const product = new Product(input);
+    let savedProduct;
+    try {
+      savedProduct = await product.save();
+    } catch (err) {
+      // If duplicate key on sku (null or collision), regenerate and retry once
+      const isDupSku = err && (err.code === 11000) && err.keyPattern && err.keyPattern.sku;
+      if (isDupSku) {
+        console.warn('Duplicate SKU detected on save; regenerating SKU and retrying once');
+        product.sku = `SKU-${Date.now().toString(36)}-${Math.random().toString(36).substring(2,8).toUpperCase()}`;
+        savedProduct = await product.save();
+      } else throw err;
+    }
     
     // Transform product to include id field for frontend compatibility
     const transformedProduct = {
