@@ -2,6 +2,9 @@ const express = require('express');
 const mongoose = require('mongoose');
 const compression = require('compression');
 const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
 require('dotenv').config();
 
 const app = express();
@@ -122,6 +125,31 @@ mongoose.connection.on('connected', () => {
 
 // Use gzip/Brotli compression for responses
 app.use(compression());
+
+// --- File uploads (local dev fallback). For production prefer S3/Cloudinary ---
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (e) { /* ignore */ }
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '';
+    const name = `img-${Date.now()}-${Math.random().toString(36).slice(2,8)}${ext}`;
+    cb(null, name);
+  }
+});
+
+const fileFilter = (req, file, cb) => {
+  if (!file.mimetype || !file.mimetype.match(/^image\/(jpeg|png|webp|gif|jpg)$/)) {
+    return cb(new Error('Only image files are allowed'), false);
+  }
+  cb(null, true);
+};
+
+const upload = multer({ storage, fileFilter, limits: { fileSize: Number(process.env.UPLOAD_MAX_BYTES || 5 * 1024 * 1024) } });
+
+// Serve uploaded files
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 // Invoice Schema
 const invoiceSchema = new mongoose.Schema({
@@ -484,10 +512,16 @@ app.get('/products', async (req, res) => {
   }
 });
 
-app.post('/products', async (req, res) => {
+app.post('/products', upload.single('image'), async (req, res) => {
   try {
-    console.log('Creating new product:', req.body);
+    console.log('Creating new product:', req.body, req.file && req.file.filename);
     const input = Object.assign({}, req.body || {});
+    // If a file was uploaded, set image_url to the served path
+    if (req.file && req.file.filename) {
+      const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+      const host = req.get('host');
+      input.image_url = `${protocol}://${host}/uploads/${req.file.filename}`;
+    }
     // If sku is missing or explicitly null/empty, generate one to avoid duplicate-key issues on sku index
     if (!input.sku || String(input.sku).trim() === '') {
       input.sku = `SKU-${Date.now().toString(36)}-${Math.random().toString(36).substring(2,8).toUpperCase()}`;
@@ -528,14 +562,19 @@ app.post('/products', async (req, res) => {
   }
 });
 
-app.put('/products/:id', async (req, res) => {
+app.put('/products/:id', upload.single('image'), async (req, res) => {
   try {
-    console.log(`Updating product with ID: ${req.params.id}`);
-    console.log('Update data:', req.body);
-    
+    console.log(`Updating product with ID: ${req.params.id}`, req.body, req.file && req.file.filename);
+    const updateData = Object.assign({}, req.body || {});
+    if (req.file && req.file.filename) {
+      const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+      const host = req.get('host');
+      updateData.image_url = `${protocol}://${host}/uploads/${req.file.filename}`;
+    }
+
     const product = await Product.findByIdAndUpdate(
       req.params.id,
-      req.body,
+      updateData,
       { new: true }
     );
     
