@@ -101,17 +101,49 @@ mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 5000, maxP
 async function ensureIndexes() {
   try {
     const coll = mongoose.connection.collection('products');
-    // category index
-    await coll.createIndex({ category: 1 });
-    // text index for quick name/description search
-    await coll.createIndex({ name: 'text', description: 'text' });
-    // ensure sku unique only when present (ignore null/absent)
+
+    // Inspect existing indexes so we only create what's missing
+    let existing = [];
     try {
-      await coll.createIndex({ sku: 1 }, { unique: true, partialFilterExpression: { sku: { $exists: true, $ne: null } } });
-    } catch (e) {
-      // If index exists with different options, skip quietly
-      console.warn('Could not create sku unique partial index (it may already exist):', e.message || e);
+      existing = await coll.indexes();
+    } catch (ie) {
+      // If indexes() isn't supported for some driver versions, fall back to attempting creates
+      existing = [];
     }
+    const existingNames = (existing || []).map(i => i && i.name).filter(Boolean);
+
+    // Create category index if missing
+    if (!existingNames.includes('category_1')) {
+      try { await coll.createIndex({ category: 1 }, { name: 'category_1' }); } catch (e) { console.warn('Could not create category index:', e && e.message ? e.message : e); }
+    }
+
+    // Create text index for quick name/description search if missing
+    const textIndexName = 'name_text_description_text';
+    if (!existingNames.includes(textIndexName)) {
+      try { await coll.createIndex({ name: 'text', description: 'text' }, { name: textIndexName }); } catch (e) { console.warn('Could not create text index:', e && e.message ? e.message : e); }
+    }
+
+    // Attempt to create a safe unique index on sku.
+    // Some MongoDB environments reject partialFilterExpression expressions; as a safer fallback,
+    // only create a strict unique index if there are no documents with missing/null sku values.
+    try {
+      // If driver supports partialFilterExpression, prefer that (best semantics)
+      await coll.createIndex({ sku: 1 }, { unique: true, partialFilterExpression: { sku: { $exists: true, $ne: null } }, name: 'sku_unique_partial' });
+    } catch (partialErr) {
+      // Partial index creation failed (older Mongo / unsupported expression). Try a safer approach:
+      try {
+        const sample = await coll.find({ $or: [{ sku: { $exists: false } }, { sku: null }] }).limit(1).toArray();
+        if (sample.length === 0) {
+          // No null/absent skus found, create a strict unique index
+          try { await coll.createIndex({ sku: 1 }, { unique: true, name: 'sku_unique' }); } catch (e) { console.warn('Could not create strict sku unique index:', e && e.message ? e.message : e); }
+        } else {
+          console.warn('Skipping strict sku unique index because there are existing documents with null/absent sku. Run a migration to populate skus before creating a unique index.');
+        }
+      } catch (probeErr) {
+        console.warn('Could not probe for null/absent skus when attempting to create sku index:', probeErr && probeErr.message ? probeErr.message : probeErr);
+      }
+    }
+
     console.log('Product indexes ensured');
   } catch (e) {
     console.warn('Error ensuring indexes:', e && e.message ? e.message : e);
