@@ -1,5 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
+const compression = require('compression');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -88,9 +89,39 @@ try {
 
 // MongoDB connection
 // Connect to MongoDB with a reasonable serverSelectionTimeout so failures fail fast in production
-mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 5000 })
+// Connect to MongoDB with a larger poolSize to handle concurrent requests better
+mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 5000, maxPoolSize: Number(process.env.MONGODB_POOL || 20) })
 .then(() => console.log('Connected to MongoDB'))
 .catch(err => console.error('MongoDB connection error:', err && err.message ? err.message : err));
+
+// Create helpful indexes on startup (idempotent)
+async function ensureIndexes() {
+  try {
+    const coll = mongoose.connection.collection('products');
+    // category index
+    await coll.createIndex({ category: 1 });
+    // text index for quick name/description search
+    await coll.createIndex({ name: 'text', description: 'text' });
+    // ensure sku unique only when present (ignore null/absent)
+    try {
+      await coll.createIndex({ sku: 1 }, { unique: true, partialFilterExpression: { sku: { $exists: true, $ne: null } } });
+    } catch (e) {
+      // If index exists with different options, skip quietly
+      console.warn('Could not create sku unique partial index (it may already exist):', e.message || e);
+    }
+    console.log('Product indexes ensured');
+  } catch (e) {
+    console.warn('Error ensuring indexes:', e && e.message ? e.message : e);
+  }
+}
+
+// Run ensureIndexes after mongoose connects
+mongoose.connection.on('connected', () => {
+  ensureIndexes().catch(() => {});
+});
+
+// Use gzip/Brotli compression for responses
+app.use(compression());
 
 // Invoice Schema
 const invoiceSchema = new mongoose.Schema({
@@ -422,18 +453,26 @@ app.post('/admin/login', async (req, res) => {
 });
 
 // Product Routes (existing functionality)
+// Paginated, projected products endpoint with caching headers
 app.get('/products', async (req, res) => {
   try {
-  const start = Date.now()
-  const products = await Product.find();
-  const took = Date.now() - start
-  console.log(`Fetched products in ${took}ms`)
-    // Transform products to include id field for frontend compatibility
-    const transformedProducts = products.map(product => ({
-      ...product.toObject(),
-      id: product._id.toString()
-    }));
-    res.json(transformedProducts);
+    const start = Date.now();
+    const page = Math.max(1, parseInt(req.query.page || '1', 10));
+    const limit = Math.min(48, parseInt(req.query.limit || '24', 10));
+    const skip = (page - 1) * limit;
+
+    // Cache: 60s browser, 300s CDN/edge, with stale-while-revalidate
+    res.set('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+
+    // Only select the fields needed for listing to reduce payload
+    const projection = { name: 1, price: 1, image_url: 1, category: 1, stock_quantity: 1, sku: 1, description: 1 };
+    const products = await Product.find({}, projection).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
+    const took = Date.now() - start;
+    console.log(`Fetched products page=${page} limit=${limit} in ${took}ms`);
+
+    // Add id field for frontend compatibility
+    const transformedProducts = products.map(p => ({ ...p, id: String(p._id) }));
+    res.json({ page, limit, items: transformedProducts });
   } catch (error) {
     console.error('Error fetching products:', error && error.message ? error.message : error);
     const isTimeout = error && (String(error.message).toLowerCase().includes('timeout') || String(error.message).toLowerCase().includes('timed out'))
