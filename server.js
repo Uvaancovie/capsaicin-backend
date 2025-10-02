@@ -10,6 +10,24 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Optional sanitize-html for server-side sanitization of CMS content
+let sanitizeHtml = null;
+try { sanitizeHtml = require('sanitize-html'); } catch (e) { console.warn('sanitize-html not installed; HTML sanitization will be skipped'); }
+
+// Simple SSE clients registry for live product change notifications
+const sseClients = new Set();
+
+function broadcastSSE(event, data) {
+  const payload = `event: ${event}\n` + `data: ${JSON.stringify(data)}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(payload);
+    } catch (e) {
+      // ignore write errors
+    }
+  }
+}
+
 // Middleware
 // CORS - allow configured frontends and local dev. Use FRONTEND_URL or FRONTEND_URLS (comma-separated)
 // CORS - allow configured frontend origins and local dev.
@@ -301,6 +319,36 @@ const productSchema = new mongoose.Schema({
 
 const Product = mongoose.model('Product', productSchema);
 
+// Blog schema
+const blogSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  slug: { type: String, required: false },
+  excerpt: { type: String, default: '' },
+  content: { type: String, required: true },
+  author: { type: String, default: 'Admin' },
+  published: { type: Boolean, default: true },
+}, { timestamps: true });
+const BlogPost = mongoose.model('BlogPost', blogSchema);
+
+// Advice schema (simple articles/tips)
+const adviceSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  excerpt: { type: String, default: '' },
+  content: { type: String, required: true },
+  author: { type: String, default: 'Admin' },
+  published: { type: Boolean, default: true },
+}, { timestamps: true });
+const Advice = mongoose.model('Advice', adviceSchema);
+
+// Video schema: supports either external url or uploaded file_url
+const videoSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  description: { type: String, default: '' },
+  video_url: { type: String, default: '' },
+  published: { type: Boolean, default: true },
+}, { timestamps: true });
+const Video = mongoose.model('Video', videoSchema);
+
 // Generate unique invoice number
 const generateInvoiceNumber = () => {
   const timestamp = Date.now().toString();
@@ -524,9 +572,31 @@ app.get('/products', async (req, res) => {
     // Cache: 60s browser, 300s CDN/edge, with stale-while-revalidate
     res.set('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
 
+    // Conditional requests: set Last-Modified and ETag based on latest product updatedAt
+    try {
+      const latest = await Product.findOne().sort({ updatedAt: -1 }).select({ updatedAt: 1 }).lean();
+      if (latest && latest.updatedAt) {
+        const lastModified = new Date(latest.updatedAt).toUTCString();
+        res.set('Last-Modified', lastModified);
+        const etag = `W/"${new Date(latest.updatedAt).getTime()}"`;
+        res.set('ETag', etag);
+        // If client has fresh copy, return 304
+        if (req.headers['if-none-match'] === etag || req.headers['if-modified-since'] === lastModified) {
+          return res.status(304).end();
+        }
+      }
+    } catch (e) {
+      // ignore caching probe errors
+    }
+
     // Only select the fields needed for listing to reduce payload
     const projection = { name: 1, price: 1, image_url: 1, category: 1, stock_quantity: 1, sku: 1, description: 1 };
-    const products = await Product.find({}, projection).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
+    // Allow filtering by category (e.g., ?category=Jewellery)
+    const filter = {};
+    if (req.query.category) {
+      filter.category = String(req.query.category);
+    }
+    const products = await Product.find(filter, projection).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
     const took = Date.now() - start;
     console.log(`Fetched products page=${page} limit=${limit} in ${took}ms`);
 
@@ -579,6 +649,8 @@ app.post('/products', upload.single('image'), async (req, res) => {
     };
     
     console.log('Product created successfully');
+    // Broadcast create event to SSE clients
+    broadcastSSE('product_created', transformedProduct);
     res.status(201).json({
       success: true,
       message: 'Product created successfully',
@@ -625,6 +697,8 @@ app.put('/products/:id', upload.single('image'), async (req, res) => {
       id: product._id.toString()
     };
 
+    // Broadcast update
+    broadcastSSE('product_updated', transformedProduct);
     res.json({
       success: true,
       message: 'Product updated successfully',
@@ -655,6 +729,8 @@ app.delete('/products/:id', async (req, res) => {
       success: true,
       message: 'Product deleted successfully'
     });
+    // Broadcast delete
+    try { broadcastSSE('product_deleted', { id: req.params.id }); } catch (e) {}
   } catch (error) {
     console.error('Error deleting product:', error);
     res.status(500).json({
@@ -677,3 +753,215 @@ try {
 } catch (e) {
   console.warn('Unable to set server timeout:', e && e.message)
 }
+
+// SSE endpoint for live product events (clients can listen for product_created/product_updated/product_deleted)
+app.get('/products/stream', (req, res) => {
+  // Set headers for SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders && res.flushHeaders();
+
+  // Add to clients set
+  sseClients.add(res);
+
+  // Send a welcome ping
+  res.write(`event: ping\ndata: welcome\n\n`);
+
+  // Remove on close
+  req.on('close', () => {
+    sseClients.delete(res);
+  });
+});
+
+// --- Blog CRUD ---
+app.get('/blog', async (req, res) => {
+  try {
+    const posts = await BlogPost.find({}).sort({ createdAt: -1 }).lean();
+    res.json(posts.map(p => ({ ...p, id: p._id })))
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.get('/blog/:id', async (req, res) => {
+  try {
+    const post = await BlogPost.findById(req.params.id).lean();
+    if (!post) return res.status(404).json({ error: 'Not found' });
+    res.json({ ...post, id: post._id });
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.post('/blog', async (req, res) => {
+  try {
+    // Sanitize content server-side if sanitizeHtml is available
+    const input = Object.assign({}, req.body || {});
+    try {
+      if (sanitizeHtml && input.content) {
+        input.content = sanitizeHtml(input.content, {
+          allowedTags: sanitizeHtml.defaults.allowedTags,
+          allowedAttributes: sanitizeHtml.defaults.allowedAttributes,
+          allowedSchemes: ['http', 'https', 'mailto']
+        });
+      }
+    } catch (sanErr) {
+      console.warn('Error sanitizing blog content:', sanErr && sanErr.message ? sanErr.message : sanErr);
+    }
+
+    const post = new BlogPost(input);
+    const saved = await post.save();
+    const out = { ...saved.toObject(), id: saved._id };
+    broadcastSSE('blog_created', out);
+    res.status(201).json(out);
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.put('/blog/:id', async (req, res) => {
+  try {
+    // Sanitize incoming content
+    const input = Object.assign({}, req.body || {});
+    try {
+      if (sanitizeHtml && input.content) {
+        input.content = sanitizeHtml(input.content, {
+          allowedTags: sanitizeHtml.defaults.allowedTags,
+          allowedAttributes: sanitizeHtml.defaults.allowedAttributes,
+          allowedSchemes: ['http', 'https', 'mailto']
+        });
+      }
+    } catch (sanErr) {
+      console.warn('Error sanitizing blog content:', sanErr && sanErr.message ? sanErr.message : sanErr);
+    }
+
+    const updated = await BlogPost.findByIdAndUpdate(req.params.id, input, { new: true });
+    if (!updated) return res.status(404).json({ error: 'Not found' });
+    const out = { ...updated.toObject(), id: updated._id };
+    broadcastSSE('blog_updated', out);
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.delete('/blog/:id', async (req, res) => {
+  try {
+    await BlogPost.findByIdAndDelete(req.params.id);
+    broadcastSSE('blog_deleted', { id: req.params.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+// --- Advice CRUD ---
+app.get('/advice', async (req, res) => {
+  try {
+    const posts = await Advice.find({}).sort({ createdAt: -1 }).lean();
+    res.json(posts.map(p => ({ ...p, id: p._id })))
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.get('/advice/:id', async (req, res) => {
+  try {
+    const item = await Advice.findById(req.params.id).lean();
+    if (!item) return res.status(404).json({ error: 'Not found' });
+    res.json({ ...item, id: item._id });
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.post('/advice', async (req, res) => {
+  try {
+    const input = Object.assign({}, req.body || {});
+    try {
+      if (sanitizeHtml && input.content) {
+        input.content = sanitizeHtml(input.content, {
+          allowedTags: sanitizeHtml.defaults.allowedTags,
+          allowedAttributes: sanitizeHtml.defaults.allowedAttributes,
+          allowedSchemes: ['http', 'https', 'mailto']
+        });
+      }
+    } catch (sanErr) {
+      console.warn('Error sanitizing advice content:', sanErr && sanErr.message ? sanErr.message : sanErr);
+    }
+
+    const post = new Advice(input);
+    const saved = await post.save();
+    const out = { ...saved.toObject(), id: saved._id };
+    broadcastSSE('advice_created', out);
+    res.status(201).json(out);
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.put('/advice/:id', async (req, res) => {
+  try {
+    const input = Object.assign({}, req.body || {});
+    try {
+      if (sanitizeHtml && input.content) {
+        input.content = sanitizeHtml(input.content, {
+          allowedTags: sanitizeHtml.defaults.allowedTags,
+          allowedAttributes: sanitizeHtml.defaults.allowedAttributes,
+          allowedSchemes: ['http', 'https', 'mailto']
+        });
+      }
+    } catch (sanErr) {
+      console.warn('Error sanitizing advice content:', sanErr && sanErr.message ? sanErr.message : sanErr);
+    }
+
+    const updated = await Advice.findByIdAndUpdate(req.params.id, input, { new: true });
+    if (!updated) return res.status(404).json({ error: 'Not found' });
+    const out = { ...updated.toObject(), id: updated._id };
+    broadcastSSE('advice_updated', out);
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.delete('/advice/:id', async (req, res) => {
+  try {
+    await Advice.findByIdAndDelete(req.params.id);
+    broadcastSSE('advice_deleted', { id: req.params.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+// --- Videos CRUD ---
+// GET list
+app.get('/videos', async (req, res) => {
+  try {
+    const vids = await Video.find({}).sort({ createdAt: -1 }).lean();
+    res.json(vids.map(v => ({ ...v, id: v._id })))
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+// Create video: accept either video_url in body or uploaded file under 'video'
+app.post('/videos', upload.single('video'), async (req, res) => {
+  try {
+    const input = Object.assign({}, req.body || {});
+    if (req.file && req.file.filename) {
+      const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+      const host = req.get('host');
+      input.video_url = `${protocol}://${host}/uploads/${req.file.filename}`;
+    }
+    const vid = new Video(input);
+    const saved = await vid.save();
+    const out = { ...saved.toObject(), id: saved._id };
+    broadcastSSE('video_created', out);
+    res.status(201).json(out);
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.put('/videos/:id', upload.single('video'), async (req, res) => {
+  try {
+    const input = Object.assign({}, req.body || {});
+    if (req.file && req.file.filename) {
+      const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+      const host = req.get('host');
+      input.video_url = `${protocol}://${host}/uploads/${req.file.filename}`;
+    }
+    const updated = await Video.findByIdAndUpdate(req.params.id, input, { new: true });
+    if (!updated) return res.status(404).json({ error: 'Not found' });
+    const out = { ...updated.toObject(), id: updated._id };
+    broadcastSSE('video_updated', out);
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
+
+app.delete('/videos/:id', async (req, res) => {
+  try {
+    await Video.findByIdAndDelete(req.params.id);
+    broadcastSSE('video_deleted', { id: req.params.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: String(e) }) }
+});
